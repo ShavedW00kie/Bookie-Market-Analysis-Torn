@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.1.0
-// @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Automatic Torn matching is not enabled.
+// @version      0.1.1
+// @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
 // @match        https://www.torn.com/page.php*
@@ -22,7 +22,7 @@
 // ==/UserScript==
 
 /* VERIFIED-CORE / DOM-EVIDENCE RELEASE, NOT A FINISHED AUTOMATIC BOOKIE ANALYST.
- * No native Torn DOM parser or guessed selectors. No bet placement.
+ * Torn parser limited to supplied fixtures; external matching unverified. No bet placement.
  * See README and provider audit for blocked requirements.
  */
 (function (nativeInfo) {
@@ -2489,7 +2489,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -2792,6 +2792,101 @@ const Providers = (()=>{
     };
 })();
 
+/* Torn DOM reader: selectors grounded in user-supplied October 2026 samples.
+ * No external probability or settlement equivalence is inferred from markup.
+ */
+const TornDOM = (() => {
+    const text=n=>(n?.textContent||'').replace(/\s+/g,' ').trim();
+    const clean=n=>{const c=n.cloneNode(true);c.querySelectorAll('.label,.tbma-inline').forEach(x=>x.remove());return text(c);};
+    function stake(raw,fallback) {
+        const s=String(raw??'').trim();
+        if(!s)return {amount:Core.number(fallback,'default stake'),hypothetical:true};
+        if(!/^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?$/.test(s))throw new Error('Enter a plain numeric stake');
+        const n=Number(s.replace(/,/g,''));if(n<0||n>1e9)throw new Error('Stake outside supported range');
+        return {amount:n,hypothetical:false};
+    }
+    function card(node,hash) {
+        const route=String(hash).match(/^#\/([^/]+)\/(\d+)\/?$/);
+        const name=node.querySelector('.matchName .name p');if(!name)return null;
+        const participants=Array.from(name.querySelectorAll('b')).map(text);if(participants.length!==2)return null;
+        const competition=text(name).replace(/^.*?\s-\s/,'');
+        const markets=[];
+        // Each supplied market list holds its own heading and outcome rows.
+        for(const list of node.querySelectorAll('ul.bets-wrap')) {
+            let current=null;
+            for(const li of list.children) {
+                if(li.tagName!=='LI'||!li.classList.contains('bets'))continue;
+                const header=li.querySelector('.market-name-cell');
+                if(header){current={label:text(header.querySelector('.bold')),startText:text(header).split('due to start at')[1]?.trim()||null,outcomes:[]};markets.push(current);continue;}
+                if(!current)continue;
+                const cells=li.querySelector('.cells-wrap'),dest=cells?.querySelector('.result'),odds=cells?.querySelector('.odds.decimal');
+                if(!dest||!odds)continue;
+                let decimal=null;try{decimal=Core.decimal(clean(odds).replace(/^x\s*/i,''));}catch(_){}
+                const input=cells.querySelector('input.amount[type="text"]');
+                const label=text(dest.querySelector('span'));
+                current.outcomes.push({label,decimal,input,dest,suspended:/suspended/i.test(input?.value||'')||Boolean(input?.disabled),row:li});
+            }
+        }
+        const supported=markets.filter(m=>
+            (m.label==='3-Way Ordinary time'&&m.outcomes.length===3&&m.outcomes.some(o=>o.label==='Draw'))||
+            (m.label==='2-Way Full event'&&m.outcomes.length===2));
+        for(const m of supported)m.valid=participants.every(p=>m.outcomes.filter(o=>o.label===p).length===1)&&m.outcomes.every(o=>o.decimal!==null);
+        // Route ID is valid only for the expanded/active card, never siblings.
+        return {id:route&&node.classList.contains('active')?route[2]:null,sport:route?.[1]||null,participants,competition,markets:supported};
+    }
+    return {stake,card};
+})();
+let tornDiscovery,tornCards=new Map(),tornFrame=null;
+function clearTorn() {
+    tornDiscovery?.disconnect();tornDiscovery=null;
+    for(const [card,entry]of tornCards){entry.observer.disconnect();card.removeEventListener('input',entry.input);card.removeEventListener('change',entry.input);card.querySelectorAll('.tbma-inline').forEach(n=>n.remove());}
+    tornCards.clear();if(tornFrame!==null)cancelAnimationFrame(tornFrame);tornFrame=null;
+}
+function renderTornCard(card) {
+    const entry=tornCards.get(card);if(!entry)return;
+    entry.observer.disconnect();
+    try {
+        card.querySelectorAll('.tbma-inline').forEach(n=>n.remove());
+        const event=TornDOM.card(card,location.hash);if(!event)return;
+        for(const market of event.markets)for(const outcome of market.outcomes){
+            const wrap=el('details','','tbma-inline'),summary=el('summary');
+            wrap.append(summary);wrap.addEventListener('click',e=>e.stopPropagation());
+            let explanation=`${event.participants.join(' v ')} · ${market.label}. External match not verified; win probability and value unavailable. `;
+            try {
+                if(!market.valid||outcome.suspended)throw new Error(outcome.suspended?'Suspended / unavailable':'Incomplete or unsupported odds');
+                const s=TornDOM.stake(outcome.input?.value,settings.stake);
+                summary.textContent=`Calc. profit if won ${money(s.amount*(outcome.decimal-1))} · ${s.hypothetical?'default':'entered'} stake ${money(s.amount)}`;
+                explanation+=`Calculated gross return ${money(s.amount*outcome.decimal)}; net profit ${money(s.amount*(outcome.decimal-1))}. Uses displayed ×${outcome.decimal}; assumes a full win with stake returned and no fees. Actual Torn rounding and special settlements are unverified. `;
+                if(s.amount>settings.maxStake)explanation+='Above your advisory stake cap. ';
+            }catch(e){summary.textContent='Calculation unavailable';explanation+=e.message;}
+            wrap.append(el('p',explanation));outcome.dest.append(wrap);
+        }
+    }finally{if(card.isConnected)entry.observer.observe(card,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['value','disabled','class']});}
+}
+function queueTorn() {
+    if(tornFrame!==null)return;
+    tornFrame=requestAnimationFrame(()=>{tornFrame=null;
+        for(const [card,entry]of tornCards){if(!card.isConnected){entry.observer.disconnect();card.removeEventListener('input',entry.input);card.removeEventListener('change',entry.input);tornCards.delete(card);}else renderTornCard(card);}
+    });
+}
+function discoverTorn(node) {
+    if(!(node instanceof Element)||root?.contains(node)||node.closest('.tbma-inline'))return;
+    const names=[...(node.matches('.matchName')?[node]:[]),...node.querySelectorAll('.matchName')];
+    for(const name of names){const card=name.closest('li.c-pointer');if(!card||tornCards.has(card))continue;
+        const input=()=>renderTornCard(card),observer=new MutationObserver(queueTorn);
+        tornCards.set(card,{input,observer});card.addEventListener('input',input);card.addEventListener('change',input);renderTornCard(card);
+        // A verified card gives an anchor without guessing Torn content IDs.
+        const list=card.parentElement;if(list?.tagName==='UL'&&root&&!list.contains(root)&&!root.contains(list))list.before(root);
+    }
+}
+function startTorn() {
+    clearTorn();if(!isBookie())return;
+    discoverTorn(document.body);
+    // Discovery examines added subtrees only. Card observers handle content changes.
+    tornDiscovery=new MutationObserver(records=>{for(const r of records)for(const n of r.addedNodes)discoverTorn(n);if([...tornCards.keys()].some(c=>!c.isConnected))queueTorn();});
+    tornDiscovery.observe(document.body,{childList:true,subtree:true});
+}
+
 /* Verification-release interface. No selectors for unobserved Torn event markup. */
 const CATEGORIES=['American Football','Australian Football','Badminton','Baseball','Basketball','Boxing','Counter-Strike','Dota 2','Football','Formula 1','Handball','Hockey','Horse Racing','League of Legends','MMA UFC','Overwatch','Rugby','Rugby League','Snooker','StarCraft 2','Tennis','Volleyball'];
 let root,content,statusLine,sourceArea,settingsArea,ledgerArea,support,lifeObserver;
@@ -2839,7 +2934,7 @@ async function buildSettings() {
         next.minEdge/=100;
         if(next.minEdge>1 || next.maxAge<30 || next.maxAge>3600 || !Number.isInteger(next.minSources)||next.minSources<1||next.minSources>20)throw new Error('Invalid quality threshold');
         for(const p of ['toa','papi','poly'])if(!Number.isInteger(next[p+'Budget']) || next[p+'Budget']>PROVIDERS[p].limit)throw new Error('Budget exceeds free/local cap');
-        await Storage.write('settings',next);settings=next;statusLine.textContent='Settings saved. Limits are advisory and apply only to locally recorded paper bets.';
+        await Storage.write('settings',next);settings=next;queueTorn();statusLine.textContent='Settings saved. Limits are advisory and apply only to locally recorded paper bets.';
     }));
     settingsArea.append(el('p','All amounts are Torn dollars. Daily summaries use UTC. Profit targets never change stakes. This release does not know your actual bets or full account exposure. API refresh is manual and cache-aware. Local monthly budgets use calendar months; provider billing quotas may reset on different dates.'));
     for(const [id,p]of Object.entries(PROVIDERS)) {
@@ -3023,14 +3118,15 @@ function buildEvidence(parent) {
         const pick=e=>{if(root.contains(e.target))return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();clean();selected=e.target;try{refresh();statusLine.textContent='Selected. Use Parent element until the preview contains just the event/market, then review and save.';}catch(err){showError(err);}};
         const escape=e=>{if(e.key==='Escape'){clean();statusLine.textContent='Selection cancelled.';}};
         window.addEventListener('click',pick,true);window.addEventListener('keydown',escape,true);cancelPick=clean;
-    }),button('Parent element',()=>{if(!selected?.parentElement)throw new Error('Select an element first');const next=selected.parentElement;const html=sanitizedElement(next);selected=next;preview.value=html;}),preview,button('Save reviewed sample',()=>{
+    }),button('Parent element',()=>{if(!selected?.parentElement)throw new Error('Select an element first');const next=selected.parentElement;let html;try{html=sanitizedElement(next);}catch(error){statusLine.textContent='Stopped at the capture limit. Your previous valid selection remains below and can be saved.';return;}selected=next;preview.value=html;}),preview,button('Save reviewed sample',()=>{
         if(!preview.value)throw new Error('Select an event card first');return download('TBMA_DOM_sample.txt','TBMA sanitized DOM sample\nRoute: '+location.pathname+'?sid=bookie'+location.hash+'\nCaptured: '+new Date().toISOString()+'\n\n'+preview.value,'text/plain');
     }));
-    box.append(el('p','Also include a screenshot showing the same odds and a hypothetical stake/potential-profit display. Do not place a bet for testing. Do not send API keys, cookies, account credentials, or a full network/HAR export.'));
+    box.append(el('p','Existing-bet samples are optional: collect one only when you naturally have a bet. No bet is required for testing. The supplied football and NFL samples are already incorporated.'));
 }
 function styles() {
     if(document.getElementById('tbma-style'))return;const s=el('style');s.id='tbma-style';s.textContent=`
-#tbma-root{box-sizing:border-box;max-width:1100px;margin:12px auto;padding:12px;background:#17202c;color:#eaf0f8;border:1px solid #52647c;border-radius:8px;font:14px/1.5 system-ui,sans-serif;position:relative;z-index:100}
+.tbma-inline{display:block;white-space:normal;clear:both;font-size:11px;line-height:1.4;margin:4px 0;overflow-wrap:anywhere}.tbma-inline summary{cursor:pointer;color:#87cfff}.tbma-inline p{padding:6px;max-width:36em;color:inherit}.tbma-inline summary:focus-visible{outline:2px solid #87cfff}
+#tbma-root{box-sizing:border-box;max-width:1100px;margin:8px auto;padding:8px;background:#17202c;color:#eaf0f8;border:1px solid #52647c;border-radius:8px;font:14px/1.5 system-ui,sans-serif;position:relative;z-index:100}
 #tbma-root *{box-sizing:border-box}#tbma-root [hidden]{display:none!important}#tbma-root header{display:flex;align-items:center;gap:8px;flex-wrap:wrap}#tbma-root header strong{flex:1}#tbma-root button,#tbma-root select,#tbma-root input{font:inherit;border:1px solid #798ca4;border-radius:5px;min-height:38px;padding:6px 9px;background:#25364b;color:#fff;max-width:100%}#tbma-root button{cursor:pointer;margin:3px}#tbma-root button:disabled{opacity:.5;cursor:default}#tbma-root :focus-visible{outline:3px solid #7cbfff;outline-offset:2px}#tbma-root input[type=checkbox]{min-height:22px;width:22px}#tbma-root h3{font-size:16px;margin:12px 0 6px;color:#fff}#tbma-root p{margin:8px 0}#tbma-root a{color:#9bcdff}#tbma-root details{border-top:1px solid #40516a;padding:9px 0;margin-top:6px}#tbma-root summary{cursor:pointer;padding:7px 0;font-weight:600}#tbma-root table{width:100%;border-collapse:collapse;font-size:13px}#tbma-root td,#tbma-root th{text-align:left;border-bottom:1px solid #40516a;padding:8px;vertical-align:top;overflow-wrap:anywhere}#tbma-root .tbma-scroll{overflow-x:auto}#tbma-root .tbma-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}#tbma-root .tbma-field{display:flex;flex-direction:column;gap:4px;margin:7px 0}#tbma-root textarea{width:100%;background:#0f1722;color:#dce8f8;font:12px/1.4 monospace;padding:8px}#tbma-root .tbma-notice{border-left:3px solid #e9b85a;padding:8px;background:#283044}#tbma-root [data-tbma-health]{display:flex;flex-direction:column;font-size:12px;color:#b9c9de}#tbma-root #tbma-support{position:static!important;inset:auto!important;z-index:auto!important;max-width:360px;margin-top:16px}#tbma-root #tbma-support .tw-torn-tip{color:#112000!important}
 @media(max-width:500px){#tbma-root{margin:6px;padding:9px}#tbma-root .tbma-grid{grid-template-columns:1fr}#tbma-root table{font-size:12px}}
 `;document.head.append(s);
@@ -3045,12 +3141,12 @@ async function mount() {
     const collapse=button(settings.collapsed?'Expand':'Collapse',async()=>{settings.collapsed=!settings.collapsed;content.hidden=settings.collapsed;collapse.textContent=settings.collapsed?'Expand':'Collapse';collapse.setAttribute('aria-expanded',String(!settings.collapsed));await Storage.write('settings',settings);});collapse.setAttribute('aria-controls',content.id);collapse.setAttribute('aria-expanded',String(!settings.collapsed));
     settingsArea=el('div');settingsArea.hidden=true;settingsArea.id='tbma-settings';
     const gear=button('⚙ Settings',()=>{settingsArea.hidden=!settingsArea.hidden;gear.setAttribute('aria-expanded',String(!settingsArea.hidden));});gear.setAttribute('aria-controls',settingsArea.id);gear.setAttribute('aria-expanded','false');
-    head.append(title,collapse,gear);statusLine=el('p','Automatic Torn extraction: awaiting authenticated page samples. No bets or estimates have been inferred.','tbma-notice');statusLine.setAttribute('role','status');
+    head.append(title,collapse,gear);statusLine=el('p','Calculated returns on supported expanded markets. External win probabilities and value matching are not yet verified.','tbma-notice');statusLine.setAttribute('role','status');
     const health=el('div');health.setAttribute('data-tbma-health','');
-    root.append(head,statusLine,health,content,settingsArea);document.body.prepend(root);
-    content.append(el('p','This verification build supplies real API readers, an independent calculator, a paper journal, and a DOM sample collector. Automatic event matching, inline Torn annotations, and real-bet accounting are not active.'));
+    root.append(head,content,settingsArea);content.append(statusLine,health);document.body.prepend(root);
+    content.append(el('p','This verification build supplies real API readers, an independent calculator, a paper journal, and a DOM sample collector. Supported expanded Torn markets show calculated returns. Automatic external matching and real-bet accounting remain unavailable.'));
     buildEvidence(content);buildProviderExplorer(content);buildCalculator(content);await buildSettings();renderHealth();
-    log('mounted',{version:VERSION,mode:'verification',automaticTornIntegration:false});
+    log('mounted',{version:VERSION,mode:'verification',automaticTornIntegration:"observed-layouts-only"});
 }
 async function start() {
     const saved=await Storage.read('settings',{});
@@ -3060,15 +3156,15 @@ async function start() {
     settings.maxAge=Math.min(3600,Math.max(30,settings.maxAge));settings.minEdge=Math.min(1,settings.minEdge);settings.minSources=Math.min(20,Math.max(1,Math.round(settings.minSources)));
     for(const p of ['toa','papi','poly'])settings[p+'Budget']=Math.min(PROVIDERS[p].limit,Math.floor(settings[p+'Budget']));
     const stored=await Storage.read('journal',[]);if(Array.isArray(stored))for(const r of stored.slice(0,1000)){try{journal.push(validateJournalRow(r));}catch(_){log('journal','Skipped malformed saved record','WARN');}}
-    await mount();
-    const navigate=()=>{routeGeneration++;cancelPick?.();clearTimeout(freshnessTimer);currentReference=null;if(sourceArea)sourceArea.replaceChildren(el('p','Route changed. Select and refresh the relevant external event.'));if(!isBookie()){root?.remove();return;}void mount().catch(showError);};
+    await mount();startTorn();
+    const navigate=()=>{clearTorn();routeGeneration++;cancelPick?.();clearTimeout(freshnessTimer);currentReference=null;if(sourceArea)sourceArea.replaceChildren(el('p','Route changed. Select and refresh the relevant external event.'));if(!isBookie()){root?.remove();return;}void mount().then(startTorn).catch(showError);};
     window.addEventListener('hashchange',navigate,{signal:listeners.signal});window.addEventListener('popstate',navigate,{signal:listeners.signal});
     document.addEventListener('visibilitychange',()=>{if(document.hidden){routeGeneration++;clearTimeout(freshnessTimer);currentReference=null;if(sourceArea)sourceArea.replaceChildren(el('p','Page hidden; refresh references after returning.'));}},{signal:listeners.signal});
     // Observe direct body children only, to reattach our own panel after a layout replacement.
     lifeObserver=new MutationObserver(()=>{if(isBookie() && root && !root.isConnected)document.body.prepend(root);});
     lifeObserver.observe(document.body,{childList:true});
-    window.addEventListener('pagehide',()=>{routeGeneration++;cancelPick?.();clearTimeout(freshnessTimer);lifeObserver?.disconnect();},{signal:listeners.signal});
-    window.addEventListener('pageshow',()=>{if(isBookie())lifeObserver?.observe(document.body,{childList:true});},{signal:listeners.signal});
+    window.addEventListener('pagehide',()=>{clearTorn();routeGeneration++;cancelPick?.();clearTimeout(freshnessTimer);lifeObserver?.disconnect();},{signal:listeners.signal});
+    window.addEventListener('pageshow',()=>{if(isBookie()){lifeObserver?.observe(document.body,{childList:true});startTorn();}},{signal:listeners.signal});
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>void start().catch(showError),{once:true});
 else void start().catch(showError);
