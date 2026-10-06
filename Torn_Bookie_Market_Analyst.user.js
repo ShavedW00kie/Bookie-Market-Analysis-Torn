@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.1.2
+// @version      0.2.0
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -2489,7 +2489,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.1.2';
+const VERSION = '0.2.0';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -2888,6 +2888,88 @@ function startTorn() {
     tornDiscovery.observe(document.body,{childList:true,subtree:true});
 }
 
+/* Candidate identity matching is separate from settlement compatibility. */
+const EventBridge=(()=>{
+ function time(value){
+  const m=String(value).match(/^(\d{2}):(\d{2}):(\d{2}) - (\d{2})\/(\d{2})\/(\d{4}) TCT$/);
+  if(!m)throw new Error('Unrecognized Torn start time');
+  const [h,n,s,d,mo,y]=m.slice(1).map(Number),t=new Date(Date.UTC(y,mo-1,d,h,n,s));
+  if(t.getUTCFullYear()!==y||t.getUTCMonth()!==mo-1||t.getUTCDate()!==d||t.getUTCHours()!==h||t.getUTCMinutes()!==n||t.getUTCSeconds()!==s)throw new Error('Invalid Torn date');
+  return t.toISOString();
+ }
+ function key(t){return JSON.stringify([t.id,t.sport,t.competition,t.participants,t.markets.map(m=>[m.label,m.startText,m.outcomes.map(o=>o.label)])]);}
+ function candidates(t,events,competition,now=Date.now()){
+  if(!t?.id||!['football','american-football'].includes(t.sport))throw new Error('Open a football or American Football event detail route');
+  if(t.markets.length!==1||!t.markets[0].valid)throw new Error('Exactly one complete supported market is required');
+  const expected=t.sport==='football'?'3-Way Ordinary time':'2-Way Full event';
+  if(t.markets[0].label!==expected)throw new Error('Incompatible Torn market');
+  if(!competition||!(t.sport==='football'?competition.startsWith('soccer_'):competition.startsWith('americanfootball_')))throw new Error('Provider sport does not match Torn sport');
+  const start=Date.parse(time(t.markets[0].startText));if(start<=now)throw new Error('Event has started; pre-match comparison only');
+  const names=t.participants.map(Core.name).sort().join('|'),accepted=new Map(),rejected=[];
+  for(const e of events){
+   let reason='';const delta=Math.abs(Date.parse(e.start)-start);
+   if(e.sportKey!==competition)reason='Different competition key';
+   else if(!Array.isArray(e.participants)||e.participants.length!==2||e.participants.map(Core.name).sort().join('|')!==names)reason='Participant mismatch';
+   else if(!Number.isFinite(delta)||delta>300000)reason='Start differs by more than five minutes';
+   else if(Date.parse(e.start)<=now)reason='Provider event has started';
+   if(reason)rejected.push({id:e.id,reason});else accepted.set(e.id,{event:e,score:delta===0?100:95,delta});
+  }
+  return {matches:[...accepted.values()],rejected};
+ }
+ function align(t,r){
+  const names=t.markets[0].outcomes.map(o=>o.label),sources=[],rejected=[...r.rejected];
+  for(const s of r.sources){
+   const order=names.map(n=>s.outcomes.findIndex(o=>Core.name(o)===Core.name(n)));
+   if(s.outcomes.length!==names.length||order.some(i=>i<0)||new Set(order).size!==names.length){rejected.push({source:s.underlyingSource,reason:'Torn/provider outcome set differs'});continue;}
+   sources.push({...s,outcomes:names,odds:order.map(i=>s.odds[i]),probabilities:order.map(i=>s.probabilities[i])});
+  }
+  return {...r,sources,rejected};
+ }
+ return {time,key,candidates,align};
+})();
+function activeTornTarget(){
+ const items=[...tornCards.keys()].filter(n=>n.isConnected&&n.classList.contains('active')).map(n=>TornDOM.card(n,location.hash)).filter(e=>e?.id);
+ if(items.length!==1)throw new Error('Open exactly one supported Torn event first');return items[0];
+}
+function buildEventComparison(parent){
+ const box=detail(parent,'Compare the open Torn event — The Odds API');
+ box.append(el('p','Enable The Odds API and save its free-plan key in Settings first. Choose the same competition, confirm the mapping, then find the event. Exact names and start times are checked; settlement equivalence remains unverified.'));
+ const target=el('p','Open an expanded football or NFL event.'),status=el('p');box.append(target);
+ const select=selectInput(box,'Provider competition',[['','Load competitions first']]);
+ const confirm=labelInput(box,'I confirm this provider competition is the same competition shown in Torn','checkbox');confirm.checked=false;
+ let catalog=[],shownKey='',sequence=0;
+ const reset=()=>{sequence++;confirm.checked=false;status.textContent='Selection changed. Confirm the competition before comparing.';};select.addEventListener('change',reset);
+ box.append(button('Load competitions / identify open event',async()=>{
+  const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t);shownKey=k;target.textContent=t.participants.join(' v ')+' · '+t.competition+' · '+EventBridge.time(t.markets[0]?.startText);
+  const saved=await Storage.read('competitionMappings',{}),all=await Providers.sports();if(g!==routeGeneration||token!==sequence||EventBridge.key(activeTornTarget())!==k)return;
+  const group=t.sport==='football'?'Soccer':'American Football';catalog=all.filter(s=>s.group===group);select.replaceChildren(el('option','Choose the matching competition'));select.firstChild.value='';
+  for(const s of catalog){const o=el('option',s.title);o.value=s.key;select.append(o);}
+  const prior=saved?.[t.sport+'|'+t.competition];if(catalog.some(s=>s.key===prior))select.value=prior;
+  confirm.checked=false;status.textContent=catalog.length?'Review the competition selection. A saved mapping still requires confirmation.':'No supported competitions returned.';
+ }));
+ box.append(button('Find event and load reference odds',async()=>{
+  const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t),competition=select.value;
+  if(k!==shownKey)throw new Error('Torn event changed. Load competitions / identify open event again');
+  if(!confirm.checked||!catalog.some(s=>s.key===competition))throw new Error('Choose and confirm the corresponding competition');
+  EventBridge.candidates(t,[],competition);
+  const saved=await Storage.read('competitionMappings',{}),maps=saved&&typeof saved==='object'&&!Array.isArray(saved)?saved:{};
+  maps[t.sport+'|'+t.competition]=competition;await Storage.write('competitionMappings',Object.fromEntries(Object.entries(maps).slice(-100)));
+  status.textContent='Looking for exact participants and a start within five minutes…';
+  const fresh=()=>g===routeGeneration&&token===sequence&&competition===select.value&&confirm.checked&&EventBridge.key(activeTornTarget())===k;
+  const list=await Providers.toaEvents(competition);if(!fresh())return;
+  const found=EventBridge.candidates(t,list,competition);
+  if(found.matches.length!==1){status.textContent=found.matches.length?'Ambiguous: more than one fixture matches. No odds requested.':'Unmatched: no exact participant/time match. No odds requested. Names may differ or the provider may lack coverage.';return;}
+  const match=found.matches[0];status.textContent='Unique identity candidate found; loading selected event odds…';
+  const raw=await Providers.toaOdds(competition,match.event.id);if(!fresh())return;
+  const verified=EventBridge.candidates(activeTornTarget(),[raw.event],competition);
+  if(verified.matches.length!==1)throw new Error('Provider event changed while loading odds');
+  const result=EventBridge.align(t,raw);
+  result.identityNote=`Torn event ${t.id}: ${t.participants.join(' v ')}. Identity score ${match.score}/100 (not win probability). Competition mapping confirmed by you: ${t.competition} → ${competition}. Start difference ${match.delta/1000} seconds. Settlement rules remain unverified; no Torn win estimate, EV, favorite or value recommendation.`;
+  renderReference(result);status.textContent='Reference loaded below. Identity candidate only; settlement comparison remains blocked.';
+ }));
+ box.append(status);safeLink(box,'Free plan signup','https://the-odds-api.com/');
+}
+
 /* Verification-release interface. No selectors for unobserved Torn event markup. */
 const CATEGORIES=['American Football','Australian Football','Badminton','Baseball','Basketball','Boxing','Counter-Strike','Dota 2','Football','Formula 1','Handball','Hockey','Horse Racing','League of Legends','MMA UFC','Overwatch','Rugby','Rugby League','Snooker','StarCraft 2','Tennis','Volleyball'];
 let root,content,statusLine,sourceArea,settingsArea,ledgerArea,support,lifeObserver;
@@ -2982,6 +3064,7 @@ function renderReference(result) {
     if(expiries.length)freshnessTimer=setTimeout(()=>{if(currentReference===result && root?.isConnected)renderReference(result);},Math.min(...expiries)+20);
     sourceArea.append(el('p','Reference freshness evaluated at '+new Date().toISOString()+'. Refresh is manual.'));
     sourceArea.append(el('h3','External market reference — not a verified Torn match'));
+    if(result.identityNote)sourceArea.append(el('p',result.identityNote,'tbma-notice'));
     sourceArea.append(el('p',result.ruleStatus,'tbma-notice'));
     if(result.provider==='poly') {
         sourceArea.append(el('strong',result.title));
@@ -3147,7 +3230,7 @@ async function mount() {
     const health=el('div');health.setAttribute('data-tbma-health','');
     root.append(head,content,settingsArea);content.append(statusLine,health);document.body.prepend(root);
     content.append(el('p','This verification build supplies real API readers, an independent calculator, a paper journal, and a DOM sample collector. Supported expanded Torn markets show calculated returns. Automatic external matching and real-bet accounting remain unavailable.'));
-    buildEvidence(content);buildProviderExplorer(content);buildCalculator(content);await buildSettings();renderHealth();
+    buildEventComparison(content);buildEvidence(content);buildProviderExplorer(content);buildCalculator(content);await buildSettings();renderHealth();
     log('mounted',{version:VERSION,mode:'verification',automaticTornIntegration:"observed-layouts-only"});
 }
 async function start() {
