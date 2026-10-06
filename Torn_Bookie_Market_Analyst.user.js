@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.2.0
+// @version      0.2.1
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -2489,7 +2489,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -2523,6 +2523,10 @@ const Storage = {
         if (!isolatedStorage) return '';
         try { const key=await gmRead(PREFIX+'secret.'+provider,''); if(typeof key==='string') {sessionKeys.set(provider,key);return key;} } catch (_) {}
         return '';
+    },
+    async credentialStatus(provider) {
+        if(isolatedStorage){try{const saved=await gmRead(PREFIX+'secret.'+provider,'');if(typeof saved==='string'&&saved)return 'Credential saved in userscript storage';}catch(_){return 'Credential storage could not be read';}}
+        return sessionKeys.get(provider)?'Credential available for this page session only':'No credential saved';
     },
     async saveKey(provider,value,persist) {
         if (value && (value.length>256 || /\s/.test(value))) throw new Error('Invalid credential: no whitespace; maximum 256 characters');
@@ -2600,15 +2604,15 @@ async function api(provider,path,params={},cost=1,ttl=60000) {
     if(!PROVIDERS[provider]) throw new Error('Provider not implemented');
     if(!settings[provider+'Enabled']) throw new Error('Enable this provider in settings first');
     const generation=routeGeneration;
-    const cacheName=provider+':'+path+':'+JSON.stringify(params);
+    const cacheName=provider+':'+path+':'+JSON.stringify(params)+(ttl===0?':fresh':'');
     if(inflight.has(cacheName)) return inflight.get(cacheName);
     const work=serializedNetwork(async()=>{
         if(!isBookie() || generation!==routeGeneration || document.hidden) throw new Error('Page changed or hidden; request cancelled');
         const conf=PROVIDERS[provider];
-        const cache=ttl?await Storage.read('cache.'+cacheName,null):null;
-        if(cache && cache.expires>Date.now()) return cache.data;
         let key='';
         if(provider!=='poly') { key=await Storage.key(provider); if(!key)throw new Error('Enter an API key in settings'); }
+        const cache=ttl?await Storage.read('cache.'+cacheName,null):null;
+        if(cache && cache.expires>Date.now()) {networkState.set(provider,{...networkState.get(provider),status:'Cached data available (not a fresh key test)'});return cache.data;}
         const url=new URL(path,'https://'+(path==='/book'?'clob.polymarket.com':conf.host));
         for(const [k,v] of Object.entries(params)) url.searchParams.set(k,String(v));
         if(key)url.searchParams.set('apiKey',key);
@@ -2750,8 +2754,8 @@ const Providers = (()=>{
     }
     return {
         toaParse,papiParse,polyBook,
-        async sports() {
-            return array(await api('toa','/v4/sports',{},0,86400000),'sports').filter(s=>s.active===true && s.has_outrights===false)
+        async sports(fresh=false) {
+            return array(await api('toa','/v4/sports',{},0,fresh?0:86400000),'sports').filter(s=>s.active===true && s.has_outrights===false)
                 .map(s=>({key:id(s.key),title:str(s.title,'title'),group:str(s.group,'group')}));
         },
         async toaEvents(sport) {
@@ -2925,7 +2929,18 @@ const EventBridge=(()=>{
   }
   return {...r,sources,rejected};
  }
- return {time,key,candidates,align};
+
+ // Accent/punctuation folding is for suggestions only, never the identity gate.
+ const tokens=value=>new Set(String(value).normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/\b(?:19|20)\d{2}\b/g,' ').split(/[^a-z0-9]+/).filter(x=>x&&!['soccer','americanfootball','football','grp'].includes(x)));
+ function overlap(a,b){const aa=tokens(a),bb=tokens(b),both=[...aa].filter(x=>bb.has(x));return both.length/Math.max(1,new Set([...aa,...bb]).size);}
+ function suggestions(t,catalog){return catalog.map(s=>({...s,suggestion:overlap(t.competition,s.title+' '+s.key)})).sort((a,b)=>b.suggestion-a.suggestion||a.title.localeCompare(b.title));}
+ function diagnostics(t,list,competition,now=Date.now()){
+  const result=candidates(t,list,competition,now),start=Date.parse(time(t.markets[0].startText)),reasons=new Map(result.rejected.map(r=>[r.id,r.reason]));
+  return list.map(e=>{const a=t.participants,b=e.participants;const similarity=Math.max(overlap(a[0],b[0])+overlap(a[1],b[1]),overlap(a[0],b[1])+overlap(a[1],b[0]))/2;
+   return {id:e.id,participants:e.participants,start:e.start,deltaMinutes:(Date.parse(e.start)-start)/60000,similarity,reason:reasons.get(e.id)||'Identity candidate'};
+  }).sort((a,b)=>b.similarity-a.similarity||Math.abs(a.deltaMinutes)-Math.abs(b.deltaMinutes)).slice(0,6);
+ }
+ return {time,key,candidates,align,suggestions,diagnostics};
 })();
 function activeTornTarget(){
  const items=[...tornCards.keys()].filter(n=>n.isConnected&&n.classList.contains('active')).map(n=>TornDOM.card(n,location.hash)).filter(e=>e?.id);
@@ -2935,17 +2950,19 @@ function buildEventComparison(parent){
  const box=detail(parent,'Compare the open Torn event — The Odds API');
  box.append(el('p','Enable The Odds API and save its free-plan key in Settings first. Choose the same competition, confirm the mapping, then find the event. Exact names and start times are checked; settlement equivalence remains unverified.'));
  const target=el('p','Open an expanded football or NFL event.'),status=el('p');box.append(target);
+ const diagnostic=detail(box,'Matching diagnostics — nearby provider fixtures');let report=null;
+ diagnostic.append(el('p','Run a comparison to see actual provider names, kickoff differences and rejection reasons.'));
  const select=selectInput(box,'Provider competition',[['','Load competitions first']]);
  const confirm=labelInput(box,'I confirm this provider competition is the same competition shown in Torn','checkbox');confirm.checked=false;
  let catalog=[],shownKey='',sequence=0;
- const reset=()=>{sequence++;confirm.checked=false;status.textContent='Selection changed. Confirm the competition before comparing.';};select.addEventListener('change',reset);
+ const reset=()=>{sequence++;report=null;confirm.checked=false;status.textContent='Selection changed. Confirm the competition before comparing.';};select.addEventListener('change',reset);
  box.append(button('Load competitions / identify open event',async()=>{
   const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t);shownKey=k;target.textContent=t.participants.join(' v ')+' · '+t.competition+' · '+EventBridge.time(t.markets[0]?.startText);
   const saved=await Storage.read('competitionMappings',{}),all=await Providers.sports();if(g!==routeGeneration||token!==sequence||EventBridge.key(activeTornTarget())!==k)return;
-  const group=t.sport==='football'?'Soccer':'American Football';catalog=all.filter(s=>s.group===group);select.replaceChildren(el('option','Choose the matching competition'));select.firstChild.value='';
-  for(const s of catalog){const o=el('option',s.title);o.value=s.key;select.append(o);}
-  const prior=saved?.[t.sport+'|'+t.competition];if(catalog.some(s=>s.key===prior))select.value=prior;
-  confirm.checked=false;status.textContent=catalog.length?'Review the competition selection. A saved mapping still requires confirmation.':'No supported competitions returned.';
+  const group=t.sport==='football'?'Soccer':'American Football';catalog=EventBridge.suggestions(t,all.filter(s=>s.group===group));select.replaceChildren(el('option','Choose the matching competition'));select.firstChild.value='';
+  for(const s of catalog){const o=el('option',s.title+(s.suggestion>0?' — keyword suggestion':''));o.value=s.key;select.append(o);}
+  const prior=saved?.[t.sport+'|'+t.competition];if(catalog.some(s=>s.key===prior))select.value=prior;else if(catalog[0]?.suggestion>=0.5&&catalog[0].suggestion-(catalog[1]?.suggestion||0)>=0.1)select.value=catalog[0].key;
+  confirm.checked=false;status.textContent=catalog.length?'Competitions ranked by league/location keywords. Review the suggested or saved selection; neither is a verified match.':'No supported competitions returned.';
  }));
  box.append(button('Find event and load reference odds',async()=>{
   const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t),competition=select.value;
@@ -2958,7 +2975,12 @@ function buildEventComparison(parent){
   const fresh=()=>g===routeGeneration&&token===sequence&&competition===select.value&&confirm.checked&&EventBridge.key(activeTornTarget())===k;
   const list=await Providers.toaEvents(competition);if(!fresh())return;
   const found=EventBridge.candidates(t,list,competition);
-  if(found.matches.length!==1){status.textContent=found.matches.length?'Ambiguous: more than one fixture matches. No odds requested.':'Unmatched: no exact participant/time match. No odds requested. Names may differ or the provider may lack coverage.';return;}
+  const rows=EventBridge.diagnostics(t,list,competition);report={version:VERSION,capturedAt:new Date().toISOString(),torn:{id:t.id,competition:t.competition,participants:t.participants,start:EventBridge.time(t.markets[0].startText)},providerCompetition:competition,returnedCount:list.length,nearby:rows};
+  diagnostic.replaceChildren(el('summary','Matching diagnostics — nearby provider fixtures'));
+  diagnostic.append(el('p',list.length+' fixtures returned. Keyword similarity is for diagnosis only; it cannot approve a match.'));
+  table(diagnostic,['Provider participants','Provider start (UTC)','Minutes from Torn start','Rejection / status'],rows.map(e=>[e.participants.join(' v '),e.start,Number.isFinite(e.deltaMinutes)?e.deltaMinutes.toFixed(1):'Invalid',e.reason]));
+  diagnostic.append(button('Download matching diagnostics (no keys)',()=>download('TBMA_Matching_Diagnostics.json',JSON.stringify(report,null,2))));
+  if(found.matches.length!==1){status.textContent=found.matches.length?'Ambiguous: more than one fixture matches. No odds requested.':'Unmatched: no exact participant/time match. No odds requested. Expand Matching diagnostics to see returned names and kickoff differences.';diagnostic.open=true;return;}
   const match=found.matches[0];status.textContent='Unique identity candidate found; loading selected event odds…';
   const raw=await Providers.toaOdds(competition,match.event.id);if(!fresh())return;
   const verified=EventBridge.candidates(activeTornTarget(),[raw.event],competition);
@@ -3026,11 +3048,12 @@ async function buildSettings() {
         enabled.addEventListener('change',()=>void(async()=>{try{const next={...settings,[id+'Enabled']:enabled.checked};await Storage.write('settings',next);settings=next;renderHealth();}catch(e){showError(e);}})());
         if(id!=='poly') {
             const input=labelInput(box,'API key','password','');input.autocomplete='off';input.spellcheck=false;
+            const credentialState=el('p',await Storage.credentialStatus(id));box.append(credentialState);
             const persist=labelInput(box,'Remember key in isolated userscript storage','checkbox');persist.checked=isolatedStorage;persist.disabled=!isolatedStorage;
-            box.append(button('Show / hide',()=>{input.type=input.type==='password'?'text':'password';}),button('Save key',async()=>{await changeKey(id,input.value.trim(),persist.checked);input.value='';}),button('Delete saved key',async()=>{await changeKey(id,'',false);input.value='';}));
+            box.append(button('Show / hide',()=>{input.type=input.type==='password'?'text':'password';}),button('Save key',async()=>{await changeKey(id,input.value.trim(),persist.checked);input.value='';credentialState.textContent=await Storage.credentialStatus(id);}),button('Delete saved key',async()=>{await changeKey(id,'',false);input.value='';credentialState.textContent=await Storage.credentialStatus(id);}));
             box.append(button('Test saved key',async()=>{
-                if(id==='toa'){const s=await Providers.sports();statusLine.textContent='Key test passed; '+s.length+' active sports/competitions.';}
-                else{const q=await Providers.papiAccount();statusLine.textContent='Key test passed; provider quota '+q.requestCount+'/'+q.requestLimit+'.';}
+                if(id==='toa'){const s=await Providers.sports(true);networkState.set(id,{...networkState.get(id),status:'Key verified by fresh request'});statusLine.textContent='Fresh key test passed; '+s.length+' active sports/competitions.';}
+                else{const q=await Providers.papiAccount();networkState.set(id,{...networkState.get(id),status:'Key verified by fresh request'});statusLine.textContent='Key test passed; provider quota '+q.requestCount+'/'+q.requestLimit+'.';}
             }));
         }else box.append(el('p','Public market and order-book reads require no key. Trading is not implemented. Availability is checked by your actual request; blocks are not bypassed.'));
     }
