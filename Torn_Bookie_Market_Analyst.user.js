@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.1.1
+// @version      0.1.2
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -2489,7 +2489,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.1.1';
+const VERSION = '0.1.2';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -2839,7 +2839,7 @@ const TornDOM = (() => {
 let tornDiscovery,tornCards=new Map(),tornFrame=null;
 function clearTorn() {
     tornDiscovery?.disconnect();tornDiscovery=null;
-    for(const [card,entry]of tornCards){entry.observer.disconnect();card.removeEventListener('input',entry.input);card.removeEventListener('change',entry.input);card.querySelectorAll('.tbma-inline').forEach(n=>n.remove());}
+    for(const [card,entry]of tornCards){entry.observer.disconnect();card.removeEventListener('input',entry.input,true);card.removeEventListener('change',entry.input,true);card.querySelectorAll('.tbma-inline').forEach(n=>n.remove());}
     tornCards.clear();if(tornFrame!==null)cancelAnimationFrame(tornFrame);tornFrame=null;
 }
 function renderTornCard(card) {
@@ -2849,32 +2849,33 @@ function renderTornCard(card) {
         card.querySelectorAll('.tbma-inline').forEach(n=>n.remove());
         const event=TornDOM.card(card,location.hash);if(!event)return;
         for(const market of event.markets)for(const outcome of market.outcomes){
-            const wrap=el('details','','tbma-inline'),summary=el('summary');
-            wrap.append(summary);wrap.addEventListener('click',e=>e.stopPropagation());
+            const wrap=el('li','','tbma-inline'),details=el('details'),summary=el('summary');
+            wrap.setAttribute('data-tbma-outcome',outcome.label);
+            details.append(summary);wrap.append(details);wrap.addEventListener('click',e=>e.stopPropagation());
             let explanation=`${event.participants.join(' v ')} · ${market.label}. External match not verified; win probability and value unavailable. `;
             try {
                 if(!market.valid||outcome.suspended)throw new Error(outcome.suspended?'Suspended / unavailable':'Incomplete or unsupported odds');
                 const s=TornDOM.stake(outcome.input?.value,settings.stake);
-                summary.textContent=`Calc. profit if won ${money(s.amount*(outcome.decimal-1))} · ${s.hypothetical?'default':'entered'} stake ${money(s.amount)}`;
+                summary.textContent=`${outcome.label}: calc. profit if won ${money(s.amount*(outcome.decimal-1))} · ${s.hypothetical?'default':'entered'} stake ${money(s.amount)}`;
                 explanation+=`Calculated gross return ${money(s.amount*outcome.decimal)}; net profit ${money(s.amount*(outcome.decimal-1))}. Uses displayed ×${outcome.decimal}; assumes a full win with stake returned and no fees. Actual Torn rounding and special settlements are unverified. `;
                 if(s.amount>settings.maxStake)explanation+='Above your advisory stake cap. ';
-            }catch(e){summary.textContent='Calculation unavailable';explanation+=e.message;}
-            wrap.append(el('p',explanation));outcome.dest.append(wrap);
+            }catch(e){summary.textContent=outcome.label+': calculation unavailable';explanation+=e.message;}
+            details.append(el('p',explanation));outcome.row.after(wrap);
         }
     }finally{if(card.isConnected)entry.observer.observe(card,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['value','disabled','class']});}
 }
 function queueTorn() {
     if(tornFrame!==null)return;
     tornFrame=requestAnimationFrame(()=>{tornFrame=null;
-        for(const [card,entry]of tornCards){if(!card.isConnected){entry.observer.disconnect();card.removeEventListener('input',entry.input);card.removeEventListener('change',entry.input);tornCards.delete(card);}else renderTornCard(card);}
+        for(const [card,entry]of tornCards){if(!card.isConnected){entry.observer.disconnect();card.removeEventListener('input',entry.input,true);card.removeEventListener('change',entry.input,true);tornCards.delete(card);}else renderTornCard(card);}
     });
 }
 function discoverTorn(node) {
     if(!(node instanceof Element)||root?.contains(node)||node.closest('.tbma-inline'))return;
     const names=[...(node.matches('.matchName')?[node]:[]),...node.querySelectorAll('.matchName')];
     for(const name of names){const card=name.closest('li.c-pointer');if(!card||tornCards.has(card))continue;
-        const input=()=>renderTornCard(card),observer=new MutationObserver(queueTorn);
-        tornCards.set(card,{input,observer});card.addEventListener('input',input);card.addEventListener('change',input);renderTornCard(card);
+        const input=()=>queueTorn(),observer=new MutationObserver(queueTorn);
+        tornCards.set(card,{input,observer});card.addEventListener('input',input,true);card.addEventListener('change',input,true);renderTornCard(card);
         // A verified card gives an anchor without guessing Torn content IDs.
         const list=card.parentElement;if(list?.tagName==='UL'&&root&&!list.contains(root)&&!root.contains(list))list.before(root);
     }
@@ -3125,7 +3126,8 @@ function buildEvidence(parent) {
 }
 function styles() {
     if(document.getElementById('tbma-style'))return;const s=el('style');s.id='tbma-style';s.textContent=`
-.tbma-inline{display:block;white-space:normal;clear:both;font-size:11px;line-height:1.4;margin:4px 0;overflow-wrap:anywhere}.tbma-inline summary{cursor:pointer;color:#87cfff}.tbma-inline p{padding:6px;max-width:36em;color:inherit}.tbma-inline summary:focus-visible{outline:2px solid #87cfff}
+li.tbma-inline{display:block!important;position:static!important;float:none!important;clear:both!important;height:auto!important;min-height:0!important;max-height:none!important;box-sizing:border-box!important;width:100%!important;overflow:visible!important;white-space:normal!important;list-style:none!important;margin:0!important;padding:5px 10px!important;background:#202b37!important;color:#eaf0f8!important;font:12px/1.5 system-ui,sans-serif!important;text-align:left!important;border-bottom:1px solid #536171!important}li.tbma-inline details{display:block!important;position:static!important;height:auto!important;white-space:normal!important}li.tbma-inline summary{display:list-item!important;position:static!important;height:auto!important;white-space:normal!important;cursor:pointer;color:#a8dcff!important;overflow-wrap:anywhere;line-height:1.5!important;margin:0!important;padding:2px 0!important}li.tbma-inline p{display:block!important;position:static!important;height:auto!important;white-space:normal!important;margin:4px 0!important;padding:0!important;color:#eaf0f8!important;line-height:1.5!important}li.tbma-inline summary:focus-visible{outline:2px solid #87cfff}
+
 #tbma-root{box-sizing:border-box;max-width:1100px;margin:8px auto;padding:8px;background:#17202c;color:#eaf0f8;border:1px solid #52647c;border-radius:8px;font:14px/1.5 system-ui,sans-serif;position:relative;z-index:100}
 #tbma-root *{box-sizing:border-box}#tbma-root [hidden]{display:none!important}#tbma-root header{display:flex;align-items:center;gap:8px;flex-wrap:wrap}#tbma-root header strong{flex:1}#tbma-root button,#tbma-root select,#tbma-root input{font:inherit;border:1px solid #798ca4;border-radius:5px;min-height:38px;padding:6px 9px;background:#25364b;color:#fff;max-width:100%}#tbma-root button{cursor:pointer;margin:3px}#tbma-root button:disabled{opacity:.5;cursor:default}#tbma-root :focus-visible{outline:3px solid #7cbfff;outline-offset:2px}#tbma-root input[type=checkbox]{min-height:22px;width:22px}#tbma-root h3{font-size:16px;margin:12px 0 6px;color:#fff}#tbma-root p{margin:8px 0}#tbma-root a{color:#9bcdff}#tbma-root details{border-top:1px solid #40516a;padding:9px 0;margin-top:6px}#tbma-root summary{cursor:pointer;padding:7px 0;font-weight:600}#tbma-root table{width:100%;border-collapse:collapse;font-size:13px}#tbma-root td,#tbma-root th{text-align:left;border-bottom:1px solid #40516a;padding:8px;vertical-align:top;overflow-wrap:anywhere}#tbma-root .tbma-scroll{overflow-x:auto}#tbma-root .tbma-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}#tbma-root .tbma-field{display:flex;flex-direction:column;gap:4px;margin:7px 0}#tbma-root textarea{width:100%;background:#0f1722;color:#dce8f8;font:12px/1.4 monospace;padding:8px}#tbma-root .tbma-notice{border-left:3px solid #e9b85a;padding:8px;background:#283044}#tbma-root [data-tbma-health]{display:flex;flex-direction:column;font-size:12px;color:#b9c9de}#tbma-root #tbma-support{position:static!important;inset:auto!important;z-index:auto!important;max-width:360px;margin-top:16px}#tbma-root #tbma-support .tw-torn-tip{color:#112000!important}
 @media(max-width:500px){#tbma-root{margin:6px;padding:9px}#tbma-root .tbma-grid{grid-template-columns:1fr}#tbma-root table{font-size:12px}}
