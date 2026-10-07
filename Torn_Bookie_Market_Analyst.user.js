@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.2.5
+// @version      0.2.6
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -2489,7 +2489,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.2.5';
+const VERSION = '0.2.6';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -2754,9 +2754,9 @@ const Providers = (()=>{
     }
     return {
         toaParse,papiParse,polyBook,
-        async sports(fresh=false,includeInactive=false) {
-            return array(await api('toa','/v4/sports',includeInactive?{all:true}:{},0,fresh?0:86400000),'sports').filter(s=>(s.active===true || (includeInactive && s.active===false)) && s.has_outrights===false)
-                .map(s=>({key:id(s.key),title:str(s.title,'title'),group:str(s.group,'group'),active:s.active}));
+        async sports(fresh=false,includeInactive=false,includeOutrights=false) {
+            return array(await api('toa','/v4/sports',includeInactive?{all:true}:{},0,fresh?0:86400000),'sports').filter(s=>(s.active===true || (includeInactive && s.active===false)) && (s.has_outrights===false || (includeOutrights && s.has_outrights===true)))
+                .map(s=>({key:id(s.key),title:str(s.title,'title'),group:str(s.group,'group'),active:s.active,hasOutrights:s.has_outrights}));
         },
         async toaEvents(sport) {
             return array(await api('toa','/v4/sports/'+id(sport)+'/events',{},0,300000),'events').map(toaEvent);
@@ -2992,19 +2992,25 @@ function buildEventComparison(parent){
  const reset=()=>{sequence++;report=null;catalogReport=null;confirm.checked=false;status.textContent='Selection changed. Confirm the competition before comparing.';};select.addEventListener('change',reset);inactive.addEventListener('change',()=>{reset();shownKey='';select.replaceChildren(el('option','Reload competitions to apply this change'));select.firstChild.value='';catalog=[];});
  box.append(button('Load competitions / identify open event',async()=>{
   const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t),includeInactive=inactive.checked;shownKey='';confirm.checked=false;catalogReport=null;catalog=[];select.replaceChildren(el('option','Loading competitions…'));select.firstChild.value='';target.textContent=(t.eventTitle||t.participants.join(' v '))+' · '+t.competition+' · Sport route: '+t.sport+' · '+(t.markets[0]?.startText||'Supported market start unavailable');
-  const saved=await Storage.read('competitionMappings',{}),all=await Providers.sports(true,includeInactive);if(g!==routeGeneration||token!==sequence||EventBridge.key(activeTornTarget())!==k)return;
-  shownKey=k;catalog=EventBridge.suggestions(t,EventBridge.catalogFor(t,all));select.replaceChildren(el('option','Choose the matching competition'));select.firstChild.value='';
+  const saved=await Storage.read('competitionMappings',{}),all=await Providers.sports(true,includeInactive,true);if(g!==routeGeneration||token!==sequence||EventBridge.key(activeTornTarget())!==k)return;
+  shownKey=k;catalog=EventBridge.suggestions(t,EventBridge.catalogFor(t,all.filter(s=>s.hasOutrights===false)));select.replaceChildren(el('option','Choose the matching competition'));select.firstChild.value='';
   for(const s of catalog){const o=el('option',s.title+(s.active===false?' [out of season]':'')+(s.suggestion>0?' — keyword suggestion':''));o.value=s.key;select.append(o);}
   const prior=saved?.[t.sport+'|'+t.competition],decision=EventBridge.selection(catalog,prior);select.value=decision.key;
   const support=EventBridge.comparisonSupport(t),groups={};for(const item of all)groups[item.group]=(groups[item.group]||0)+1;
+  const outrightEntries=all.filter(s=>s.hasOutrights===true),nonOutrightCount=all.length-outrightEntries.length;
   const mode=includeInactive?'including out of season':'in season only';
-  status.textContent=`${catalog.length} same-sport competitions of ${all.length} non-outright entries returned (${mode}; fresh request). ${decision.reason} `+(!support?'Guided event matching for this sport is not implemented; catalog inspection only.':'Settlement comparison remains unverified.');
-  catalogReport={version:VERSION,capturedAt:new Date().toISOString(),catalogMode:mode,freshRequest:true,torn:{id:t.id,sport:t.sport,competition:t.competition,participants:[...t.participants],markets:t.markets.map(m=>({label:m.label,startText:m.startText,valid:m.valid}))},expectedGroup:EventBridge.groupFor(t.sport),guidedMatchingSupported:!!support,providerGroups:groups,selection:decision,competitions:catalog.map(s=>({key:s.key,title:s.title,group:s.group,active:s.active,keywordScore:s.suggestion,exactPrimaryTitle:s.exactTitle===true})),allCompetitions:all.map(s=>({key:s.key,title:s.title,group:s.group,active:s.active}))};
+  status.textContent=`${catalog.length} same-sport competitions of ${all.length} catalog entries returned (${nonOutrightCount} non-outright, ${outrightEntries.length} outright) (${mode}; fresh request). ${decision.reason} `+(!support?'Guided event matching for this sport is not implemented; catalog inspection only.':'Settlement comparison remains unverified.');
+  catalogReport={version:VERSION,capturedAt:new Date().toISOString(),catalogMode:mode,includesOutrights:true,outrightCount:outrightEntries.length,nonOutrightCount,freshRequest:true,torn:{id:t.id,sport:t.sport,competition:t.competition,participants:[...t.participants],markets:t.markets.map(m=>({label:m.label,startText:m.startText,valid:m.valid}))},expectedGroup:EventBridge.groupFor(t.sport),guidedMatchingSupported:!!support,providerGroups:groups,selection:decision,competitions:catalog.map(s=>({key:s.key,title:s.title,group:s.group,active:s.active,keywordScore:s.suggestion,exactPrimaryTitle:s.exactTitle===true})),allCompetitions:all.map(s=>({key:s.key,title:s.title,group:s.group,active:s.active,hasOutrights:s.hasOutrights}))};
   catalogDetails.replaceChildren(el('summary','Competition catalog diagnostics'));
   catalogDetails.append(el('p',`Detected Torn sport: ${t.sport}. Expected provider group (normalized): ${catalogReport.expectedGroup}. ${decision.reason}`));
   table(catalogDetails,['Returned group','Competitions'],Object.entries(groups));
   table(catalogDetails,['Same-sport competition','Provider key','Active','Keyword score'],catalog.map(s=>[s.title,s.key,s.active?'Yes':'No',s.suggestion.toFixed(3)]));
-  catalogDetails.append(el('p','Scores rank names only. A blank selection is not proof of missing coverage. Zero same-sport entries can mean absent coverage or an unrecognized provider group; the export includes the returned non-outright catalog (outright entries are excluded) so we can distinguish these.'));
+  catalogDetails.append(el('p','Scores rank names only. A blank selection is not proof of missing coverage. Zero same-sport entries can mean absent coverage or an unrecognized provider group; the export now includes both outright and non-outright entries across all returned groups so we can distinguish these.'));
+  const outrightBox=detail(catalogDetails,'Outright entries — inspection only');
+  outrightBox.append(el('p','These entries were excluded from earlier exports. A season champion is not a race winner. No outright entry is eligible for guided event matching or an odds request in this release.'));
+  if(!outrightEntries.length)outrightBox.append(el('p','No outright entries returned for this catalog scope.'));
+  table(outrightBox,['Provider group','Title','Key','Active','has_outrights'],outrightEntries.map(s=>[s.group,s.title,s.key,s.active?'Yes':'No','true']));
+  if(!support)outrightBox.open=true;
   const captured=catalogReport;
   catalogDetails.append(button('Download competition diagnostics (no keys)',()=>{if(captured!==catalogReport||EventBridge.key(activeTornTarget())!==k)throw new Error('Event or options changed. Identify again before exporting.');return download('TBMA_Competition_Diagnostics.json',JSON.stringify(captured,null,2));}));
   if(!decision.key||!support)catalogDetails.open=true;
