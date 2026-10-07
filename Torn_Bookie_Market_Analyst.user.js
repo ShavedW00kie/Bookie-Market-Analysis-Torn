@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.2.3
+// @version      0.2.4
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -2489,7 +2489,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.2.3';
+const VERSION = '0.2.4';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -2905,12 +2905,31 @@ const EventBridge=(()=>{
   return t.toISOString();
  }
  function key(t){return JSON.stringify([t.id,t.sport,t.competition,t.participants,t.markets.map(m=>[m.label,m.startText,m.outcomes.map(o=>o.label)])]);}
+ // Exact sport routing. Unknown sports never fall through to American Football.
+ const sportToken=value=>String(value||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+ function groupFor(sport){
+  const token=sportToken(sport);
+  const aliases={football:'soccer',americanfootball:'americanfootball',australianfootball:'aussierules',hockey:'icehockey',mmaufc:'mixedmartialarts'};
+  return aliases[token]||token;
+ }
+ function catalogFor(t,all){const group=groupFor(t.sport);return group?all.filter(s=>sportToken(s.group)===group):[];}
+ function comparisonSupport(t){
+  const configs={football:{prefix:'soccer_',market:'3-Way Ordinary time'},americanfootball:{prefix:'americanfootball_',market:'2-Way Full event'},basketball:{prefix:'basketball_',market:'2-Way Full event'}};
+  return configs[sportToken(t?.sport)]||null;
+ }
+ function selection(catalog,prior){
+  if(prior&&catalog.some(s=>s.key===prior))return {key:prior,reason:'Restored your previously confirmed competition. Review it for this event.'};
+  const top=catalog[0],gap=(top?.suggestion||0)-(catalog[1]?.suggestion||0);
+  if(top?.suggestion>=0.5&&gap>=0.1)return {key:top.key,reason:'Clear keyword suggestion selected; confirmation still required.'};
+  return {key:'',reason:!top?'No same-sport competition in the returned catalog.':top.suggestion===0?'No shared competition keywords. Choose manually only if you recognize the exact competition.':`No automatic selection: best keyword score ${top.suggestion.toFixed(3)}, lead ${gap.toFixed(3)}; requires score ≥0.500 and lead ≥0.100. This is not event confidence.`};
+ }
  function candidates(t,events,competition,now=Date.now()){
-  if(!t?.id||!['football','american-football'].includes(t.sport))throw new Error('Open a football or American Football event detail route');
+  const support=comparisonSupport(t);
+  if(!t?.id||!support)throw new Error('Guided reference matching currently supports football, American Football and basketball only. Catalog diagnostics are available for other sports.');
   if(t.markets.length!==1||!t.markets[0].valid)throw new Error('Exactly one complete supported market is required');
-  const expected=t.sport==='football'?'3-Way Ordinary time':'2-Way Full event';
+  const expected=support.market;
   if(t.markets[0].label!==expected)throw new Error('Incompatible Torn market');
-  if(!competition||!(t.sport==='football'?competition.startsWith('soccer_'):competition.startsWith('americanfootball_')))throw new Error('Provider sport does not match Torn sport');
+  if(!competition||!competition.startsWith(support.prefix))throw new Error('Provider sport does not match Torn sport');
   const start=Date.parse(time(t.markets[0].startText));if(start<=now)throw new Error('Event has started; pre-match comparison only');
   const folded=t.participants.map(participantName);
   if(folded.length!==2||new Set(folded).size!==2)throw new Error('Participant names collide after accent normalization');
@@ -2945,7 +2964,7 @@ const EventBridge=(()=>{
    return {id:e.id,participants:e.participants,start:e.start,deltaMinutes:(Date.parse(e.start)-start)/60000,similarity,reason:reasons.get(e.id)||'Identity candidate'};
   }).sort((a,b)=>b.similarity-a.similarity||Math.abs(a.deltaMinutes)-Math.abs(b.deltaMinutes)).slice(0,6);
  }
- return {time,key,candidates,align,suggestions,diagnostics,participantName};
+ return {time,key,candidates,align,suggestions,diagnostics,participantName,groupFor,catalogFor,comparisonSupport,selection};
 })();
 function activeTornTarget(){
  const items=[...tornCards.keys()].filter(n=>n.isConnected&&n.classList.contains('active')).map(n=>TornDOM.card(n,location.hash)).filter(e=>e?.id);
@@ -2954,26 +2973,41 @@ function activeTornTarget(){
 function buildEventComparison(parent){
  const box=detail(parent,'Compare the open Torn event — The Odds API');
  box.append(el('p','Enable The Odds API and save its free-plan key in Settings first. Choose the same competition, confirm the mapping, then find the event. Names are compared without Latin accents; team qualifiers and start times are checked; settlement equivalence remains unverified.'));
- const target=el('p','Open an expanded football or NFL event.'),status=el('p');box.append(target);
+ const target=el('p','Open an expanded event. Guided reference matching supports football, American Football and basketball.'),status=el('p');box.append(target);
  const diagnostic=detail(box,'Matching diagnostics — nearby provider fixtures');let report=null;
  diagnostic.append(el('p','Run a comparison to see actual provider names, kickoff differences and rejection reasons.'));
  const select=selectInput(box,'Provider competition',[['','Load competitions first']]);
  const inactive=labelInput(box,'Include out-of-season competitions (does not guarantee event coverage)','checkbox');inactive.checked=false;
  box.append(el('p','This list contains provider competitions, not individual matches. A league is not its national cup; national-team friendlies are not club leagues. If the exact competition is absent, leave it unmatched.'));
  const confirm=labelInput(box,'I confirm this provider competition is the same competition shown in Torn','checkbox');confirm.checked=false;
- let catalog=[],shownKey='',sequence=0;
- const reset=()=>{sequence++;report=null;confirm.checked=false;status.textContent='Selection changed. Confirm the competition before comparing.';};select.addEventListener('change',reset);inactive.addEventListener('change',()=>{reset();shownKey='';select.replaceChildren(el('option','Reload competitions to apply this change'));select.firstChild.value='';catalog=[];});
+ let catalog=[],shownKey='',sequence=0,catalogReport=null;
+ const catalogDetails=detail(box,'Competition catalog diagnostics');
+ catalogDetails.append(el('p','Identify an event to inspect detected sport, returned provider groups and selection reasons.')); 
+ const reset=()=>{sequence++;report=null;catalogReport=null;confirm.checked=false;status.textContent='Selection changed. Confirm the competition before comparing.';};select.addEventListener('change',reset);inactive.addEventListener('change',()=>{reset();shownKey='';select.replaceChildren(el('option','Reload competitions to apply this change'));select.firstChild.value='';catalog=[];});
  box.append(button('Load competitions / identify open event',async()=>{
-  const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t);shownKey=k;target.textContent=t.participants.join(' v ')+' · '+t.competition+' · '+EventBridge.time(t.markets[0]?.startText);
-  const saved=await Storage.read('competitionMappings',{}),all=await Providers.sports(false,inactive.checked);if(g!==routeGeneration||token!==sequence||EventBridge.key(activeTornTarget())!==k)return;
-  const group=t.sport==='football'?'Soccer':'American Football';catalog=EventBridge.suggestions(t,all.filter(s=>s.group===group));select.replaceChildren(el('option','Choose the matching competition'));select.firstChild.value='';
+  const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t),includeInactive=inactive.checked;shownKey='';confirm.checked=false;catalogReport=null;catalog=[];select.replaceChildren(el('option','Loading competitions…'));select.firstChild.value='';target.textContent=t.participants.join(' v ')+' · '+t.competition+' · Sport route: '+t.sport+' · '+(t.markets[0]?.startText||'Supported market start unavailable');
+  const saved=await Storage.read('competitionMappings',{}),all=await Providers.sports(true,includeInactive);if(g!==routeGeneration||token!==sequence||EventBridge.key(activeTornTarget())!==k)return;
+  shownKey=k;catalog=EventBridge.suggestions(t,EventBridge.catalogFor(t,all));select.replaceChildren(el('option','Choose the matching competition'));select.firstChild.value='';
   for(const s of catalog){const o=el('option',s.title+(s.active===false?' [out of season]':'')+(s.suggestion>0?' — keyword suggestion':''));o.value=s.key;select.append(o);}
-  const prior=saved?.[t.sport+'|'+t.competition];if(catalog.some(s=>s.key===prior))select.value=prior;else if(catalog[0]?.suggestion>=0.5&&catalog[0].suggestion-(catalog[1]?.suggestion||0)>=0.1)select.value=catalog[0].key;
-  confirm.checked=false;status.textContent=catalog.length?catalog.length+' provider competitions loaded'+(inactive.checked?' (including out of season)':' (in season only)')+'. Ranked by league/location keywords. Review any selection; it is not a verified match. Missing competition? Try including out-of-season entries; if still absent, this provider catalog cannot support the mapping.':'No supported competitions returned.';
+  const prior=saved?.[t.sport+'|'+t.competition],decision=EventBridge.selection(catalog,prior);select.value=decision.key;
+  const support=EventBridge.comparisonSupport(t),groups={};for(const item of all)groups[item.group]=(groups[item.group]||0)+1;
+  const mode=includeInactive?'including out of season':'in season only';
+  status.textContent=`${catalog.length} same-sport competitions of ${all.length} non-outright entries returned (${mode}; fresh request). ${decision.reason} `+(!support?'Guided event matching for this sport is not implemented; catalog inspection only.':'Settlement comparison remains unverified.');
+  catalogReport={version:VERSION,capturedAt:new Date().toISOString(),catalogMode:mode,freshRequest:true,torn:{id:t.id,sport:t.sport,competition:t.competition,participants:[...t.participants],markets:t.markets.map(m=>({label:m.label,startText:m.startText,valid:m.valid}))},expectedGroup:EventBridge.groupFor(t.sport),guidedMatchingSupported:!!support,providerGroups:groups,selection:decision,competitions:catalog.map(s=>({key:s.key,title:s.title,group:s.group,active:s.active,keywordScore:s.suggestion})),allCompetitions:all.map(s=>({key:s.key,title:s.title,group:s.group,active:s.active}))};
+  catalogDetails.replaceChildren(el('summary','Competition catalog diagnostics'));
+  catalogDetails.append(el('p',`Detected Torn sport: ${t.sport}. Expected provider group (normalized): ${catalogReport.expectedGroup}. ${decision.reason}`));
+  table(catalogDetails,['Returned group','Competitions'],Object.entries(groups));
+  table(catalogDetails,['Same-sport competition','Provider key','Active','Keyword score'],catalog.map(s=>[s.title,s.key,s.active?'Yes':'No',s.suggestion.toFixed(3)]));
+  catalogDetails.append(el('p','Scores rank names only. A blank selection is not proof of missing coverage. Zero same-sport entries can mean absent coverage or an unrecognized provider group; the export includes the full returned catalog so we can distinguish these.'));
+  const captured=catalogReport;
+  catalogDetails.append(button('Download competition diagnostics (no keys)',()=>{if(captured!==catalogReport||EventBridge.key(activeTornTarget())!==k)throw new Error('Event or options changed. Identify again before exporting.');return download('TBMA_Competition_Diagnostics.json',JSON.stringify(captured,null,2));}));
+  if(!decision.key||!support)catalogDetails.open=true;
+
  }));
  box.append(button('Find event and load reference odds',async()=>{
   const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t),competition=select.value;
   if(k!==shownKey)throw new Error('Torn event changed. Load competitions / identify open event again');
+  if(!EventBridge.comparisonSupport(t))throw new Error('This sport supports catalog diagnostics only; guided event matching is not implemented.');
   if(!confirm.checked||!catalog.some(s=>s.key===competition))throw new Error('Choose and confirm the corresponding competition');
   EventBridge.candidates(t,[],competition);
   const saved=await Storage.read('competitionMappings',{}),maps=saved&&typeof saved==='object'&&!Array.isArray(saved)?saved:{};
@@ -3271,7 +3305,7 @@ async function mount() {
     head.append(title,collapse,gear);statusLine=el('p','Calculated returns on supported expanded markets. External win probabilities and value matching are not yet verified.','tbma-notice');statusLine.setAttribute('role','status');
     const health=el('div');health.setAttribute('data-tbma-health','');
     root.append(head,content,settingsArea);content.append(statusLine,health);document.body.prepend(root);
-    content.append(el('p','This verification build supplies real API readers, an independent calculator, a paper journal, and a DOM sample collector. Supported expanded Torn markets show calculated returns. Automatic external matching and real-bet accounting remain unavailable.'));
+    content.append(el('p','This verification build supplies real API readers, an independent calculator, a paper journal, and a DOM sample collector. Supported expanded Torn markets show calculated returns. Guided reference identity matching supports football, American Football and basketball. Other sports have catalog diagnostics. Settlement-based recommendations and real-bet accounting remain unavailable.'));
     buildEventComparison(content);buildReferencePanel(content);buildEvidence(content);buildProviderExplorer(content);buildCalculator(content);await buildSettings();renderHealth();
     log('mounted',{version:VERSION,mode:'verification',automaticTornIntegration:"observed-layouts-only"});
 }
