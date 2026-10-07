@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.2.4
+// @version      0.2.5
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -2489,7 +2489,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.2.4';
+const VERSION = '0.2.5';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -2812,7 +2812,9 @@ const TornDOM = (() => {
     function card(node,hash) {
         const route=String(hash).match(/^#\/([^/]+)\/(\d+)\/?$/);
         const name=node.querySelector('.matchName .name p');if(!name)return null;
-        const participants=Array.from(name.querySelectorAll('b')).map(text);if(participants.length!==2)return null;
+        let participants=Array.from(name.querySelectorAll('b')).map(text);
+        const race=route?.[1]==='formula-1'&&participants.length===1&&participants[0]==='Race';
+        if(!race&&participants.length!==2)return null;
         const competition=text(name).replace(/^.*?\s-\s/,'');
         const markets=[];
         // Each supplied market list holds its own heading and outcome rows.
@@ -2831,12 +2833,13 @@ const TornDOM = (() => {
                 current.outcomes.push({label,decimal,input,dest,suspended:/suspended/i.test(input?.value||'')||Boolean(input?.disabled),row:li});
             }
         }
-        const supported=markets.filter(m=>
+        const supported=markets.filter(m=>race ? m.label==='Winner Full event'&&m.outcomes.length>=2 :
             (m.label==='3-Way Ordinary time'&&m.outcomes.length===3&&m.outcomes.some(o=>o.label==='Draw'))||
             (m.label==='2-Way Full event'&&m.outcomes.length===2));
-        for(const m of supported)m.valid=participants.every(p=>m.outcomes.filter(o=>o.label===p).length===1)&&m.outcomes.every(o=>o.decimal!==null);
+        if(race)participants=supported.length===1?supported[0].outcomes.map(o=>o.label):[];
+        for(const m of supported)m.valid=(!race||(participants.length>=2&&new Set(participants.map(Core.name)).size===participants.length&&participants.every(Boolean)))&&participants.every(p=>m.outcomes.filter(o=>o.label===p).length===1)&&m.outcomes.every(o=>o.decimal!==null);
         // Route ID is valid only for the expanded/active card, never siblings.
-        return {id:route&&node.classList.contains('active')?route[2]:null,sport:route?.[1]||null,participants,competition,markets:supported};
+        return {id:route&&node.classList.contains('active')?route[2]:null,sport:route?.[1]||null,participants,competition,markets:supported,eventTitle:race?competition:null,fieldCompleteness:race?'unverified':null};
     }
     return {stake,card};
 })();
@@ -2856,12 +2859,13 @@ function renderTornCard(card) {
             const wrap=el('li','','tbma-inline'),details=el('details'),summary=el('summary');
             wrap.setAttribute('data-tbma-outcome',outcome.label);
             details.append(summary);wrap.append(details);wrap.addEventListener('click',e=>e.stopPropagation());
-            let explanation=`${event.participants.join(' v ')} · ${market.label}. External match not verified; win probability and value unavailable. `;
+            let explanation=`${event.eventTitle||event.participants.join(' v ')} · ${market.label}. External match not verified; win probability and value unavailable. `;
             try {
                 if(!market.valid||outcome.suspended)throw new Error(outcome.suspended?'Suspended / unavailable':'Incomplete or unsupported odds');
                 const s=TornDOM.stake(outcome.input?.value,settings.stake);
                 summary.textContent=`${outcome.label}: calc. profit if won ${money(s.amount*(outcome.decimal-1))} · ${s.hypothetical?'default':'entered'} stake ${money(s.amount)}`;
                 explanation+=`Calculated gross return ${money(s.amount*outcome.decimal)}; net profit ${money(s.amount*(outcome.decimal-1))}. Uses displayed ×${outcome.decimal}; assumes a full win with stake returned and no fees. Actual Torn rounding and special settlements are unverified. `;
+                if(event.fieldCompleteness)explanation+='Race field completeness, dead heats and non-starter rules are unverified. This is a full-win illustration, not a probability estimate. ';
                 if(s.amount>settings.maxStake)explanation+='Above your advisory stake cap. ';
             }catch(e){summary.textContent=outcome.label+': calculation unavailable';explanation+=e.message;}
             details.append(el('p',explanation));outcome.row.after(wrap);
@@ -2918,6 +2922,8 @@ const EventBridge=(()=>{
   return configs[sportToken(t?.sport)]||null;
  }
  function selection(catalog,prior){
+  const exact=catalog.filter(s=>s.exactTitle);
+  if(exact.length===1)return {key:exact[0].key,reason:'Exact primary competition title suggested; review country, category and settlement rules before confirming.'};
   if(prior&&catalog.some(s=>s.key===prior))return {key:prior,reason:'Restored your previously confirmed competition. Review it for this event.'};
   const top=catalog[0],gap=(top?.suggestion||0)-(catalog[1]?.suggestion||0);
   if(top?.suggestion>=0.5&&gap>=0.1)return {key:top.key,reason:'Clear keyword suggestion selected; confirmation still required.'};
@@ -2957,7 +2963,7 @@ const EventBridge=(()=>{
  // Accent/punctuation folding is for suggestions only, never the identity gate.
  const tokens=value=>new Set(String(value).normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/\b(?:19|20)\d{2}\b/g,' ').split(/[^a-z0-9]+/).filter(x=>x&&!['soccer','americanfootball','football','grp'].includes(x)));
  function overlap(a,b){const aa=tokens(a),bb=tokens(b),both=[...aa].filter(x=>bb.has(x));if(!both.some(x=>/[a-z]/.test(x)))return 0;return both.length/Math.max(1,new Set([...aa,...bb]).size);}
- function suggestions(t,catalog){return catalog.map(s=>({...s,suggestion:overlap(t.competition,s.title+' '+s.key)})).sort((a,b)=>b.suggestion-a.suggestion||a.title.localeCompare(b.title));}
+ function suggestions(t,catalog){const primary=participantName(t.competition.replace(/\s*\([^)]*\)/g,' ').replace(/\b(?:19|20)\d{2}(?:\/(?:19|20)\d{2})?\b/g,' ').trim());return catalog.map(s=>({...s,exactTitle:!!primary&&primary===participantName(s.title),suggestion:overlap(t.competition,s.title+' '+s.key)})).sort((a,b)=>b.suggestion-a.suggestion||a.title.localeCompare(b.title));}
  function diagnostics(t,list,competition,now=Date.now()){
   const result=candidates(t,list,competition,now),start=Date.parse(time(t.markets[0].startText)),reasons=new Map(result.rejected.map(r=>[r.id,r.reason]));
   return list.map(e=>{const a=t.participants,b=e.participants;const similarity=Math.max(overlap(a[0],b[0])+overlap(a[1],b[1]),overlap(a[0],b[1])+overlap(a[1],b[0]))/2;
@@ -2985,7 +2991,7 @@ function buildEventComparison(parent){
  catalogDetails.append(el('p','Identify an event to inspect detected sport, returned provider groups and selection reasons.')); 
  const reset=()=>{sequence++;report=null;catalogReport=null;confirm.checked=false;status.textContent='Selection changed. Confirm the competition before comparing.';};select.addEventListener('change',reset);inactive.addEventListener('change',()=>{reset();shownKey='';select.replaceChildren(el('option','Reload competitions to apply this change'));select.firstChild.value='';catalog=[];});
  box.append(button('Load competitions / identify open event',async()=>{
-  const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t),includeInactive=inactive.checked;shownKey='';confirm.checked=false;catalogReport=null;catalog=[];select.replaceChildren(el('option','Loading competitions…'));select.firstChild.value='';target.textContent=t.participants.join(' v ')+' · '+t.competition+' · Sport route: '+t.sport+' · '+(t.markets[0]?.startText||'Supported market start unavailable');
+  const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t),includeInactive=inactive.checked;shownKey='';confirm.checked=false;catalogReport=null;catalog=[];select.replaceChildren(el('option','Loading competitions…'));select.firstChild.value='';target.textContent=(t.eventTitle||t.participants.join(' v '))+' · '+t.competition+' · Sport route: '+t.sport+' · '+(t.markets[0]?.startText||'Supported market start unavailable');
   const saved=await Storage.read('competitionMappings',{}),all=await Providers.sports(true,includeInactive);if(g!==routeGeneration||token!==sequence||EventBridge.key(activeTornTarget())!==k)return;
   shownKey=k;catalog=EventBridge.suggestions(t,EventBridge.catalogFor(t,all));select.replaceChildren(el('option','Choose the matching competition'));select.firstChild.value='';
   for(const s of catalog){const o=el('option',s.title+(s.active===false?' [out of season]':'')+(s.suggestion>0?' — keyword suggestion':''));o.value=s.key;select.append(o);}
@@ -2993,12 +2999,12 @@ function buildEventComparison(parent){
   const support=EventBridge.comparisonSupport(t),groups={};for(const item of all)groups[item.group]=(groups[item.group]||0)+1;
   const mode=includeInactive?'including out of season':'in season only';
   status.textContent=`${catalog.length} same-sport competitions of ${all.length} non-outright entries returned (${mode}; fresh request). ${decision.reason} `+(!support?'Guided event matching for this sport is not implemented; catalog inspection only.':'Settlement comparison remains unverified.');
-  catalogReport={version:VERSION,capturedAt:new Date().toISOString(),catalogMode:mode,freshRequest:true,torn:{id:t.id,sport:t.sport,competition:t.competition,participants:[...t.participants],markets:t.markets.map(m=>({label:m.label,startText:m.startText,valid:m.valid}))},expectedGroup:EventBridge.groupFor(t.sport),guidedMatchingSupported:!!support,providerGroups:groups,selection:decision,competitions:catalog.map(s=>({key:s.key,title:s.title,group:s.group,active:s.active,keywordScore:s.suggestion})),allCompetitions:all.map(s=>({key:s.key,title:s.title,group:s.group,active:s.active}))};
+  catalogReport={version:VERSION,capturedAt:new Date().toISOString(),catalogMode:mode,freshRequest:true,torn:{id:t.id,sport:t.sport,competition:t.competition,participants:[...t.participants],markets:t.markets.map(m=>({label:m.label,startText:m.startText,valid:m.valid}))},expectedGroup:EventBridge.groupFor(t.sport),guidedMatchingSupported:!!support,providerGroups:groups,selection:decision,competitions:catalog.map(s=>({key:s.key,title:s.title,group:s.group,active:s.active,keywordScore:s.suggestion,exactPrimaryTitle:s.exactTitle===true})),allCompetitions:all.map(s=>({key:s.key,title:s.title,group:s.group,active:s.active}))};
   catalogDetails.replaceChildren(el('summary','Competition catalog diagnostics'));
   catalogDetails.append(el('p',`Detected Torn sport: ${t.sport}. Expected provider group (normalized): ${catalogReport.expectedGroup}. ${decision.reason}`));
   table(catalogDetails,['Returned group','Competitions'],Object.entries(groups));
   table(catalogDetails,['Same-sport competition','Provider key','Active','Keyword score'],catalog.map(s=>[s.title,s.key,s.active?'Yes':'No',s.suggestion.toFixed(3)]));
-  catalogDetails.append(el('p','Scores rank names only. A blank selection is not proof of missing coverage. Zero same-sport entries can mean absent coverage or an unrecognized provider group; the export includes the full returned catalog so we can distinguish these.'));
+  catalogDetails.append(el('p','Scores rank names only. A blank selection is not proof of missing coverage. Zero same-sport entries can mean absent coverage or an unrecognized provider group; the export includes the returned non-outright catalog (outright entries are excluded) so we can distinguish these.'));
   const captured=catalogReport;
   catalogDetails.append(button('Download competition diagnostics (no keys)',()=>{if(captured!==catalogReport||EventBridge.key(activeTornTarget())!==k)throw new Error('Event or options changed. Identify again before exporting.');return download('TBMA_Competition_Diagnostics.json',JSON.stringify(captured,null,2));}));
   if(!decision.key||!support)catalogDetails.open=true;
