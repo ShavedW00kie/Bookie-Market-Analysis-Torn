@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.2.2
+// @version      0.2.3
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -2489,7 +2489,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.2.2';
+const VERSION = '0.2.3';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -2754,9 +2754,9 @@ const Providers = (()=>{
     }
     return {
         toaParse,papiParse,polyBook,
-        async sports(fresh=false) {
-            return array(await api('toa','/v4/sports',{},0,fresh?0:86400000),'sports').filter(s=>s.active===true && s.has_outrights===false)
-                .map(s=>({key:id(s.key),title:str(s.title,'title'),group:str(s.group,'group')}));
+        async sports(fresh=false,includeInactive=false) {
+            return array(await api('toa','/v4/sports',includeInactive?{all:true}:{},0,fresh?0:86400000),'sports').filter(s=>(s.active===true || (includeInactive && s.active===false)) && s.has_outrights===false)
+                .map(s=>({key:id(s.key),title:str(s.title,'title'),group:str(s.group,'group'),active:s.active}));
         },
         async toaEvents(sport) {
             return array(await api('toa','/v4/sports/'+id(sport)+'/events',{},0,300000),'events').map(toaEvent);
@@ -2937,7 +2937,7 @@ const EventBridge=(()=>{
 
  // Accent/punctuation folding is for suggestions only, never the identity gate.
  const tokens=value=>new Set(String(value).normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/\b(?:19|20)\d{2}\b/g,' ').split(/[^a-z0-9]+/).filter(x=>x&&!['soccer','americanfootball','football','grp'].includes(x)));
- function overlap(a,b){const aa=tokens(a),bb=tokens(b),both=[...aa].filter(x=>bb.has(x));return both.length/Math.max(1,new Set([...aa,...bb]).size);}
+ function overlap(a,b){const aa=tokens(a),bb=tokens(b),both=[...aa].filter(x=>bb.has(x));if(!both.some(x=>/[a-z]/.test(x)))return 0;return both.length/Math.max(1,new Set([...aa,...bb]).size);}
  function suggestions(t,catalog){return catalog.map(s=>({...s,suggestion:overlap(t.competition,s.title+' '+s.key)})).sort((a,b)=>b.suggestion-a.suggestion||a.title.localeCompare(b.title));}
  function diagnostics(t,list,competition,now=Date.now()){
   const result=candidates(t,list,competition,now),start=Date.parse(time(t.markets[0].startText)),reasons=new Map(result.rejected.map(r=>[r.id,r.reason]));
@@ -2958,16 +2958,18 @@ function buildEventComparison(parent){
  const diagnostic=detail(box,'Matching diagnostics — nearby provider fixtures');let report=null;
  diagnostic.append(el('p','Run a comparison to see actual provider names, kickoff differences and rejection reasons.'));
  const select=selectInput(box,'Provider competition',[['','Load competitions first']]);
+ const inactive=labelInput(box,'Include out-of-season competitions (does not guarantee event coverage)','checkbox');inactive.checked=false;
+ box.append(el('p','This list contains provider competitions, not individual matches. A league is not its national cup; national-team friendlies are not club leagues. If the exact competition is absent, leave it unmatched.'));
  const confirm=labelInput(box,'I confirm this provider competition is the same competition shown in Torn','checkbox');confirm.checked=false;
  let catalog=[],shownKey='',sequence=0;
- const reset=()=>{sequence++;report=null;confirm.checked=false;status.textContent='Selection changed. Confirm the competition before comparing.';};select.addEventListener('change',reset);
+ const reset=()=>{sequence++;report=null;confirm.checked=false;status.textContent='Selection changed. Confirm the competition before comparing.';};select.addEventListener('change',reset);inactive.addEventListener('change',()=>{reset();shownKey='';select.replaceChildren(el('option','Reload competitions to apply this change'));select.firstChild.value='';catalog=[];});
  box.append(button('Load competitions / identify open event',async()=>{
   const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t);shownKey=k;target.textContent=t.participants.join(' v ')+' · '+t.competition+' · '+EventBridge.time(t.markets[0]?.startText);
-  const saved=await Storage.read('competitionMappings',{}),all=await Providers.sports();if(g!==routeGeneration||token!==sequence||EventBridge.key(activeTornTarget())!==k)return;
+  const saved=await Storage.read('competitionMappings',{}),all=await Providers.sports(false,inactive.checked);if(g!==routeGeneration||token!==sequence||EventBridge.key(activeTornTarget())!==k)return;
   const group=t.sport==='football'?'Soccer':'American Football';catalog=EventBridge.suggestions(t,all.filter(s=>s.group===group));select.replaceChildren(el('option','Choose the matching competition'));select.firstChild.value='';
-  for(const s of catalog){const o=el('option',s.title+(s.suggestion>0?' — keyword suggestion':''));o.value=s.key;select.append(o);}
+  for(const s of catalog){const o=el('option',s.title+(s.active===false?' [out of season]':'')+(s.suggestion>0?' — keyword suggestion':''));o.value=s.key;select.append(o);}
   const prior=saved?.[t.sport+'|'+t.competition];if(catalog.some(s=>s.key===prior))select.value=prior;else if(catalog[0]?.suggestion>=0.5&&catalog[0].suggestion-(catalog[1]?.suggestion||0)>=0.1)select.value=catalog[0].key;
-  confirm.checked=false;status.textContent=catalog.length?'Competitions ranked by league/location keywords. Review the suggested or saved selection; neither is a verified match.':'No supported competitions returned.';
+  confirm.checked=false;status.textContent=catalog.length?catalog.length+' provider competitions loaded'+(inactive.checked?' (including out of season)':' (in season only)')+'. Ranked by league/location keywords. Review any selection; it is not a verified match. Missing competition? Try including out-of-season entries; if still absent, this provider catalog cannot support the mapping.':'No supported competitions returned.';
  }));
  box.append(button('Find event and load reference odds',async()=>{
   const token=++sequence,g=routeGeneration,t=activeTornTarget(),k=EventBridge.key(t),competition=select.value;
@@ -2992,14 +2994,14 @@ function buildEventComparison(parent){
   if(verified.matches.length!==1)throw new Error('Provider event changed while loading odds');
   const result=EventBridge.align(t,raw);
   result.identityNote=`Torn event ${t.id}: ${t.participants.join(' v ')}. Identity score ${match.score}/100 (not win probability). Competition mapping confirmed by you: ${t.competition} → ${competition}. Start difference ${match.delta/1000} seconds. Latin accent normalization ${match.accentAdjusted?'was needed':'did not change the match'}. Settlement rules remain unverified; no Torn win estimate, EV, favorite or value recommendation.`;
-  renderReference(result);status.textContent='Reference loaded below. Identity candidate only; settlement comparison remains blocked.';
+  showReference(result);status.textContent='Reference results opened immediately below this comparison section. Identity candidate only; settlement comparison remains blocked.';
  }));
- box.append(status);safeLink(box,'Free plan signup','https://the-odds-api.com/');
+ box.append(status);
 }
 
 /* Verification-release interface. No selectors for unobserved Torn event markup. */
 const CATEGORIES=['American Football','Australian Football','Badminton','Baseball','Basketball','Boxing','Counter-Strike','Dota 2','Football','Formula 1','Handball','Hockey','Horse Racing','League of Legends','MMA UFC','Overwatch','Rugby','Rugby League','Snooker','StarCraft 2','Tennis','Volleyball'];
-let root,content,statusLine,sourceArea,settingsArea,ledgerArea,support,lifeObserver;
+let root,content,statusLine,sourceArea,referencePanel,settingsArea,ledgerArea,support,lifeObserver;
 let journal=[],currentReference=null,cancelPick=null,freshnessTimer=null;
 const listeners=new AbortController();
 const el=(tag,text='',className='')=>{const n=document.createElement(tag);n.textContent=text;if(className)n.className=className;return n;};
@@ -3084,6 +3086,18 @@ async function buildSettings() {
     const supportHost=el('div');settingsArea.append(supportHost);
     if(support)support.destroy();support=new SupportModule({mount:supportHost,containerId:'tbma-support',styleId:'tbma-support-style'});
 }
+function buildReferencePanel(parent) {
+    referencePanel=detail(parent,'Reference results');
+    sourceArea=el('div');sourceArea.tabIndex=-1;sourceArea.setAttribute('aria-label','External reference results');
+    sourceArea.append(el('p','No reference loaded. Use Find event and load reference odds above.'));
+    referencePanel.append(sourceArea);
+}
+function showReference(result) {
+    renderReference(result);
+    referencePanel.open=true;
+    sourceArea.focus({preventScroll:true});
+    referencePanel.scrollIntoView({block:'nearest'});
+}
 function renderReference(result) {
     clearTimeout(freshnessTimer);
     currentReference=result;sourceArea.replaceChildren();
@@ -3132,19 +3146,19 @@ function buildProviderExplorer(parent) {
     sport.addEventListener('change',()=>{events.replaceChildren();loadedSport='';});
     toa.append(button('Load events (0 credits)',async()=>{const g=routeGeneration,key=sport.value;if(!key)throw new Error('Select a sport');const list=await Providers.toaEvents(key);if(g!==routeGeneration||key!==sport.value)return;
         events.replaceChildren();loadedSport=key;for(const e of list){const o=el('option',e.participants.join(' vs ')+' — '+e.start);o.value=e.id;events.append(o);}statusLine.textContent=list.length+' external events; not matched to Torn.';
-    }),button('Read selected odds (≤1 credit)',async()=>{if(!events.value||loadedSport!==sport.value)throw new Error('Load events for this sport');const g=routeGeneration,r=await Providers.toaOdds(sport.value,events.value);if(g===routeGeneration)renderReference(r);}));
+    }),button('Read selected odds (≤1 credit)',async()=>{if(!events.value||loadedSport!==sport.value)throw new Error('Load events for this sport');const g=routeGeneration,r=await Providers.toaOdds(sport.value,events.value);if(g===routeGeneration)showReference(r);}));
     safeLink(toa,'Free key / provider plans','https://the-odds-api.com/');
     const papi=detail(explorer,'OddsPapi — tournament fixtures and full-time 1X2');
     const tournament=labelInput(papi,'Numeric tournament ID from OddsPapi documentation');
     const fixtures=selectInput(papi,'External fixture',[['','Load fixtures first']]);let loadedTournament='';
     tournament.addEventListener('input',()=>{fixtures.replaceChildren();loadedTournament='';});
-    papi.append(button('Load fixtures (≤1 request)',async()=>{const g=routeGeneration,t=tournament.value.trim(),list=await Providers.papiFixtures(t);if(g!==routeGeneration||t!==tournament.value.trim())return;loadedTournament=t;fixtures.replaceChildren();for(const e of list){const o=el('option',e.participants.join(' vs ')+' — '+e.start);o.value=e.id;fixtures.append(o);}}),button('Read selected odds (≤2 requests)',async()=>{if(!fixtures.value||loadedTournament!==tournament.value.trim())throw new Error('Load fixtures first');const g=routeGeneration,r=await Providers.papiOdds(fixtures.value);if(g===routeGeneration)renderReference(r);}));
+    papi.append(button('Load fixtures (≤1 request)',async()=>{const g=routeGeneration,t=tournament.value.trim(),list=await Providers.papiFixtures(t);if(g!==routeGeneration||t!==tournament.value.trim())return;loadedTournament=t;fixtures.replaceChildren();for(const e of list){const o=el('option',e.participants.join(' vs ')+' — '+e.start);o.value=e.id;fixtures.append(o);}}),button('Read selected odds (≤2 requests)',async()=>{if(!fixtures.value||loadedTournament!==tournament.value.trim())throw new Error('Load fixtures first');const g=routeGeneration,r=await Providers.papiOdds(fixtures.value);if(g===routeGeneration)showReference(r);}));
     safeLink(papi,'Free account','https://oddspapi.io/us/sign-up');papi.append(el('p','This adapter validates the provider’s market dictionary. Other esports and market formats remain unsupported until their schema and settlement rules are verified.'));
     const poly=detail(explorer,'Polymarket — binary market and two-sided books');
     const market=labelInput(poly,'Numeric market ID (not event ID or slug)');
-    poly.append(button('Read market (≤3 public reads)',async()=>{const g=routeGeneration,r=await Providers.polyMarket(market.value.trim());if(g===routeGeneration)renderReference(r);}));
+    poly.append(button('Read market (≤3 public reads)',async()=>{const g=routeGeneration,r=await Providers.polyMarket(market.value.trim());if(g===routeGeneration)showReference(r);}));
     safeLink(poly,'Public API documentation','https://docs.polymarket.com/api-reference/predictions/overview');
-    sourceArea=el('div');explorer.append(sourceArea);
+
 }
 function buildCalculator(parent) {
     const calc=detail(parent,'Hypothetical payout calculator and paper journal');
@@ -3258,7 +3272,7 @@ async function mount() {
     const health=el('div');health.setAttribute('data-tbma-health','');
     root.append(head,content,settingsArea);content.append(statusLine,health);document.body.prepend(root);
     content.append(el('p','This verification build supplies real API readers, an independent calculator, a paper journal, and a DOM sample collector. Supported expanded Torn markets show calculated returns. Automatic external matching and real-bet accounting remain unavailable.'));
-    buildEventComparison(content);buildEvidence(content);buildProviderExplorer(content);buildCalculator(content);await buildSettings();renderHealth();
+    buildEventComparison(content);buildReferencePanel(content);buildEvidence(content);buildProviderExplorer(content);buildCalculator(content);await buildSettings();renderHealth();
     log('mounted',{version:VERSION,mode:'verification',automaticTornIntegration:"observed-layouts-only"});
 }
 async function start() {
