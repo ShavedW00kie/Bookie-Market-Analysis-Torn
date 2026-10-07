@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.2.6
+// @version      0.2.7
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -2489,7 +2489,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.2.6';
+const VERSION = '0.2.7';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -2562,7 +2562,7 @@ function allowedURL(url) {
     const rules={
         'api.the-odds-api.com':/^\/v4\/sports\/?$|^\/v4\/sports\/[a-z0-9_]+\/events(?:\/[a-zA-Z0-9_-]+\/odds)?\/?$/,
         'api.oddspapi.io':/^\/v4\/(account|fixtures|markets|odds)$/,
-        'gamma-api.polymarket.com':/^\/markets\/\d+$/,
+        'gamma-api.polymarket.com':/^(?:\/markets\/\d+|\/public-search)$/,
         'clob.polymarket.com':/^\/book$/
     };
     if(!rules[u.hostname]?.test(u.pathname)) throw new Error('API path is not allowlisted');
@@ -2773,6 +2773,21 @@ const Providers = (()=>{
             const dict=await api('papi','/v4/markets',{language:'en'},1,7*86400000);
             const data=await api('papi','/v4/odds',{fixtureId:id(event),oddsFormat:'decimal',language:'en',verbosity:3},1,60000);
             return papiParse(data,dict);
+        },
+        async polySearch(query,page=1) {
+            query=String(query).trim();
+            if(query.length<3||query.length>120)throw new Error('Search requires 3–120 characters');
+            if(!Number.isInteger(page)||page<1||page>10)throw new Error('Search page must be 1–10');
+            const data=await api('poly','/public-search',{q:query,page,limit_per_type:10,search_profiles:false,search_tags:false},1,300000);
+            if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('Invalid search response');
+            const optional=v=>v==null?'':str(v,'search text');
+            const longText=v=>{if(v==null)return '';if(typeof v!=='string'||v.length>100000)throw new Error('Invalid resolution description');return v;};
+            const bool=v=>typeof v==='boolean'?v:null;
+            const events=array(data.events??[],'search events').map(e=>({id:id(e.id),title:str(e.title,'event title'),endDate:optional(e.endDate),active:bool(e.active),closed:bool(e.closed),
+                markets:array(e.markets??[],'search markets').map(m=>({id:id(m.id),question:str(m.question,'market question'),description:longText(m.description),endDate:optional(m.endDate),active:bool(m.active),closed:bool(m.closed),enableOrderBook:bool(m.enableOrderBook)}))}));
+            const more=data.pagination?.hasMore;
+            if(more!=null&&typeof more!=='boolean')throw new Error('Invalid search pagination');
+            return {query,page,events,hasMore:more??null,retrievedAt:new Date().toISOString()};
         },
         async polyMarket(marketId) {
             if(!/^\d{1,30}$/.test(marketId))throw new Error('Enter a numeric Polymarket market ID, not an event slug');
@@ -3182,6 +3197,34 @@ function renderReference(result) {
     const rejected=detail(sourceArea,'Rejected sources');for(const r of result.rejected)rejected.append(el('p',r.source+': '+r.reason));
     sourceArea.append(el('p','Estimates use proportional margin removal. Two-way estimates may be conditional on a decisive result when a tie refunds. Bookmaker settlement rules are not verified equivalent; no Torn edge, favorite, or value badge is generated.'));
 }
+function buildPolyDiscovery(parent,marketInput) {
+    const box=detail(parent,'Find Polymarket events — public search');
+    box.append(el('p','Enable Polymarket in Settings; no key or wallet is needed. Search returns candidates, not verified Torn matches. Check race versus season, date and resolution conditions. No prices are inferred from search metadata.'));
+    const query=labelInput(box,'Public event search','text','Singapore Grand Prix');
+    const resultArea=el('div');let sequence=0,last=null;
+    const next=el('button','Next search page (1 public read)');next.type='button';next.disabled=true;
+    next.addEventListener('click',async()=>{if(next.disabled||!last)return;try{await run(last.page+1);}catch(e){showError(e);next.disabled=true;}finally{renderHealth();}});
+    query.addEventListener('input',()=>{sequence++;last=null;next.disabled=true;resultArea.replaceChildren(el('p','Search changed. Run a new search.'));});
+    async function run(page){
+        const q=query.value.trim(),token=++sequence,g=routeGeneration;last=null;next.disabled=true;resultArea.replaceChildren(el('p','Searching public event metadata…'));
+        const r=await Providers.polySearch(q,page);if(g!==routeGeneration||token!==sequence||query.value.trim()!==q)return;
+        last=r;resultArea.replaceChildren(el('p',`Page ${r.page}: ${r.events.length} events. Search may include old, closed or unrelated contracts. End dates below are provider metadata, not verified race start times.`));
+        if(!r.events.length)resultArea.append(el('p','No events on this search page. This does not prove the provider never covers this sport.'));
+        for(const event of r.events){
+            const eventBox=detail(resultArea,event.title);eventBox.append(el('p','Event ID: '+event.id+' · End: '+(event.endDate||'Unknown')+' · Active: '+event.active+' · Closed: '+event.closed));
+            for(const m of event.markets){
+                const item=detail(eventBox,m.question);item.append(el('p',`Market ID: ${m.id} · End: ${m.endDate||'Unknown'} · Active: ${m.active} · Closed: ${m.closed}`),el('p',m.description||'Resolution description absent from search result.'));
+                const pick=button('Use this market ID for reference inspection',()=>{if(g!==routeGeneration||token!==sequence)throw new Error('Search context changed. Search again.');marketInput.value=m.id;statusLine.textContent='Market ID selected. Use Read market to inspect current books; Torn equivalence remains unverified.';});
+                pick.disabled=event.active!==true||event.closed!==false||m.active!==true||m.closed!==false||m.enableOrderBook!==true||!/^\d{1,30}$/.test(m.id);item.append(pick);
+            }
+        }
+        resultArea.append(button('Download public search diagnostics',()=>{if(g!==routeGeneration||token!==sequence)throw new Error('Search context changed. Search again.');return download('TBMA_Polymarket_Search.json',JSON.stringify({version:VERSION,...r},null,2));}));
+        next.disabled=r.hasMore!==true||r.page>=10;
+        if(r.hasMore===null)resultArea.append(el('p','Pagination status unavailable; completeness unknown.'));
+        if(r.hasMore&&r.page>=10)resultArea.append(el('p','Ten-page safety limit reached. Refine the search.'));
+    }
+    box.append(button('Search events (1 public read)',()=>run(1)),next,resultArea);
+}
 function buildProviderExplorer(parent) {
     const explorer=detail(parent,'External data — manual, quota-aware inspection');
     explorer.append(el('p','Inspect only an event you are viewing in Torn. No requests run on page load. These readers do not establish that a provider market matches Torn. Refresh uses the same cache for at least 60 seconds.'));
@@ -3202,6 +3245,7 @@ function buildProviderExplorer(parent) {
     safeLink(papi,'Free account','https://oddspapi.io/us/sign-up');papi.append(el('p','This adapter validates the provider’s market dictionary. Other esports and market formats remain unsupported until their schema and settlement rules are verified.'));
     const poly=detail(explorer,'Polymarket — binary market and two-sided books');
     const market=labelInput(poly,'Numeric market ID (not event ID or slug)');
+    buildPolyDiscovery(poly,market);
     poly.append(button('Read market (≤3 public reads)',async()=>{const g=routeGeneration,r=await Providers.polyMarket(market.value.trim());if(g===routeGeneration)showReference(r);}));
     safeLink(poly,'Public API documentation','https://docs.polymarket.com/api-reference/predictions/overview');
 
