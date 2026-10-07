@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.2.1
+// @version      0.2.2
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -2489,7 +2489,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.2.1';
+const VERSION = '0.2.2';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -2894,6 +2894,9 @@ function startTorn() {
 
 /* Candidate identity matching is separate from settlement compatibility. */
 const EventBridge=(()=>{
+ // Fold diacritics attached to Latin letters only. Preserve non-Latin marks,
+ // punctuation, words, numbers and team qualifiers. No broad transliteration.
+ const participantName=value=>Core.name(value).normalize('NFD').replace(/(\p{Script=Latin})\p{M}+/gu,'$1').normalize('NFC');
  function time(value){
   const m=String(value).match(/^(\d{2}):(\d{2}):(\d{2}) - (\d{2})\/(\d{2})\/(\d{4}) TCT$/);
   if(!m)throw new Error('Unrecognized Torn start time');
@@ -2909,22 +2912,24 @@ const EventBridge=(()=>{
   if(t.markets[0].label!==expected)throw new Error('Incompatible Torn market');
   if(!competition||!(t.sport==='football'?competition.startsWith('soccer_'):competition.startsWith('americanfootball_')))throw new Error('Provider sport does not match Torn sport');
   const start=Date.parse(time(t.markets[0].startText));if(start<=now)throw new Error('Event has started; pre-match comparison only');
-  const names=t.participants.map(Core.name).sort().join('|'),accepted=new Map(),rejected=[];
+  const folded=t.participants.map(participantName);
+  if(folded.length!==2||new Set(folded).size!==2)throw new Error('Participant names collide after accent normalization');
+  const names=folded.sort().join('|'),accepted=new Map(),rejected=[];
   for(const e of events){
    let reason='';const delta=Math.abs(Date.parse(e.start)-start);
    if(e.sportKey!==competition)reason='Different competition key';
-   else if(!Array.isArray(e.participants)||e.participants.length!==2||e.participants.map(Core.name).sort().join('|')!==names)reason='Participant mismatch';
+   else if(!Array.isArray(e.participants)||e.participants.length!==2||new Set(e.participants.map(participantName)).size!==2||e.participants.map(participantName).sort().join('|')!==names)reason='Participant mismatch';
    else if(!Number.isFinite(delta)||delta>300000)reason='Start differs by more than five minutes';
    else if(Date.parse(e.start)<=now)reason='Provider event has started';
-   if(reason)rejected.push({id:e.id,reason});else accepted.set(e.id,{event:e,score:delta===0?100:95,delta});
+   if(reason)rejected.push({id:e.id,reason});else accepted.set(e.id,{event:e,score:delta===0?100:95,delta,accentAdjusted:t.participants.map(Core.name).sort().join('|')!==e.participants.map(Core.name).sort().join('|')});
   }
   return {matches:[...accepted.values()],rejected};
  }
  function align(t,r){
   const names=t.markets[0].outcomes.map(o=>o.label),sources=[],rejected=[...r.rejected];
   for(const s of r.sources){
-   const order=names.map(n=>s.outcomes.findIndex(o=>Core.name(o)===Core.name(n)));
-   if(s.outcomes.length!==names.length||order.some(i=>i<0)||new Set(order).size!==names.length){rejected.push({source:s.underlyingSource,reason:'Torn/provider outcome set differs'});continue;}
+   const order=names.map(n=>s.outcomes.findIndex(o=>participantName(o)===participantName(n)));
+   if(new Set(names.map(participantName)).size!==names.length||new Set(s.outcomes.map(participantName)).size!==s.outcomes.length||s.outcomes.length!==names.length||order.some(i=>i<0)||new Set(order).size!==names.length){rejected.push({source:s.underlyingSource,reason:'Torn/provider outcome set differs'});continue;}
    sources.push({...s,outcomes:names,odds:order.map(i=>s.odds[i]),probabilities:order.map(i=>s.probabilities[i])});
   }
   return {...r,sources,rejected};
@@ -2940,7 +2945,7 @@ const EventBridge=(()=>{
    return {id:e.id,participants:e.participants,start:e.start,deltaMinutes:(Date.parse(e.start)-start)/60000,similarity,reason:reasons.get(e.id)||'Identity candidate'};
   }).sort((a,b)=>b.similarity-a.similarity||Math.abs(a.deltaMinutes)-Math.abs(b.deltaMinutes)).slice(0,6);
  }
- return {time,key,candidates,align,suggestions,diagnostics};
+ return {time,key,candidates,align,suggestions,diagnostics,participantName};
 })();
 function activeTornTarget(){
  const items=[...tornCards.keys()].filter(n=>n.isConnected&&n.classList.contains('active')).map(n=>TornDOM.card(n,location.hash)).filter(e=>e?.id);
@@ -2948,7 +2953,7 @@ function activeTornTarget(){
 }
 function buildEventComparison(parent){
  const box=detail(parent,'Compare the open Torn event — The Odds API');
- box.append(el('p','Enable The Odds API and save its free-plan key in Settings first. Choose the same competition, confirm the mapping, then find the event. Exact names and start times are checked; settlement equivalence remains unverified.'));
+ box.append(el('p','Enable The Odds API and save its free-plan key in Settings first. Choose the same competition, confirm the mapping, then find the event. Names are compared without Latin accents; team qualifiers and start times are checked; settlement equivalence remains unverified.'));
  const target=el('p','Open an expanded football or NFL event.'),status=el('p');box.append(target);
  const diagnostic=detail(box,'Matching diagnostics — nearby provider fixtures');let report=null;
  diagnostic.append(el('p','Run a comparison to see actual provider names, kickoff differences and rejection reasons.'));
@@ -2971,7 +2976,7 @@ function buildEventComparison(parent){
   EventBridge.candidates(t,[],competition);
   const saved=await Storage.read('competitionMappings',{}),maps=saved&&typeof saved==='object'&&!Array.isArray(saved)?saved:{};
   maps[t.sport+'|'+t.competition]=competition;await Storage.write('competitionMappings',Object.fromEntries(Object.entries(maps).slice(-100)));
-  status.textContent='Looking for exact participants and a start within five minutes…';
+  status.textContent='Looking for participants (Latin accents normalized) and a start within five minutes…';
   const fresh=()=>g===routeGeneration&&token===sequence&&competition===select.value&&confirm.checked&&EventBridge.key(activeTornTarget())===k;
   const list=await Providers.toaEvents(competition);if(!fresh())return;
   const found=EventBridge.candidates(t,list,competition);
@@ -2980,13 +2985,13 @@ function buildEventComparison(parent){
   diagnostic.append(el('p',list.length+' fixtures returned. Keyword similarity is for diagnosis only; it cannot approve a match.'));
   table(diagnostic,['Provider participants','Provider start (UTC)','Minutes from Torn start','Rejection / status'],rows.map(e=>[e.participants.join(' v '),e.start,Number.isFinite(e.deltaMinutes)?e.deltaMinutes.toFixed(1):'Invalid',e.reason]));
   diagnostic.append(button('Download matching diagnostics (no keys)',()=>download('TBMA_Matching_Diagnostics.json',JSON.stringify(report,null,2))));
-  if(found.matches.length!==1){status.textContent=found.matches.length?'Ambiguous: more than one fixture matches. No odds requested.':'Unmatched: no exact participant/time match. No odds requested. Expand Matching diagnostics to see returned names and kickoff differences.';diagnostic.open=true;return;}
+  if(found.matches.length!==1){status.textContent=found.matches.length?'Ambiguous: more than one fixture matches. No odds requested.':'Unmatched: no participant/time match after Latin accent normalization. No odds requested. Expand Matching diagnostics to see returned names and kickoff differences.';diagnostic.open=true;return;}
   const match=found.matches[0];status.textContent='Unique identity candidate found; loading selected event odds…';
   const raw=await Providers.toaOdds(competition,match.event.id);if(!fresh())return;
   const verified=EventBridge.candidates(activeTornTarget(),[raw.event],competition);
   if(verified.matches.length!==1)throw new Error('Provider event changed while loading odds');
   const result=EventBridge.align(t,raw);
-  result.identityNote=`Torn event ${t.id}: ${t.participants.join(' v ')}. Identity score ${match.score}/100 (not win probability). Competition mapping confirmed by you: ${t.competition} → ${competition}. Start difference ${match.delta/1000} seconds. Settlement rules remain unverified; no Torn win estimate, EV, favorite or value recommendation.`;
+  result.identityNote=`Torn event ${t.id}: ${t.participants.join(' v ')}. Identity score ${match.score}/100 (not win probability). Competition mapping confirmed by you: ${t.competition} → ${competition}. Start difference ${match.delta/1000} seconds. Latin accent normalization ${match.accentAdjusted?'was needed':'did not change the match'}. Settlement rules remain unverified; no Torn win estimate, EV, favorite or value recommendation.`;
   renderReference(result);status.textContent='Reference loaded below. Identity candidate only; settlement comparison remains blocked.';
  }));
  box.append(status);safeLink(box,'Free plan signup','https://the-odds-api.com/');
@@ -3235,7 +3240,7 @@ function styles() {
 li.tbma-inline{display:block!important;position:static!important;float:none!important;clear:both!important;height:auto!important;min-height:0!important;max-height:none!important;box-sizing:border-box!important;width:100%!important;overflow:visible!important;white-space:normal!important;list-style:none!important;margin:0!important;padding:5px 10px!important;background:#202b37!important;color:#eaf0f8!important;font:12px/1.5 system-ui,sans-serif!important;text-align:left!important;border-bottom:1px solid #536171!important}li.tbma-inline details{display:block!important;position:static!important;height:auto!important;white-space:normal!important}li.tbma-inline summary{display:list-item!important;position:static!important;height:auto!important;white-space:normal!important;cursor:pointer;color:#a8dcff!important;overflow-wrap:anywhere;line-height:1.5!important;margin:0!important;padding:2px 0!important}li.tbma-inline p{display:block!important;position:static!important;height:auto!important;white-space:normal!important;margin:4px 0!important;padding:0!important;color:#eaf0f8!important;line-height:1.5!important}li.tbma-inline summary:focus-visible{outline:2px solid #87cfff}
 
 #tbma-root{box-sizing:border-box;max-width:1100px;margin:8px auto;padding:8px;background:#17202c;color:#eaf0f8;border:1px solid #52647c;border-radius:8px;font:14px/1.5 system-ui,sans-serif;position:relative;z-index:100}
-#tbma-root *{box-sizing:border-box}#tbma-root [hidden]{display:none!important}#tbma-root header{display:flex;align-items:center;gap:8px;flex-wrap:wrap}#tbma-root header strong{flex:1}#tbma-root button,#tbma-root select,#tbma-root input{font:inherit;border:1px solid #798ca4;border-radius:5px;min-height:38px;padding:6px 9px;background:#25364b;color:#fff;max-width:100%}#tbma-root button{cursor:pointer;margin:3px}#tbma-root button:disabled{opacity:.5;cursor:default}#tbma-root :focus-visible{outline:3px solid #7cbfff;outline-offset:2px}#tbma-root input[type=checkbox]{min-height:22px;width:22px}#tbma-root h3{font-size:16px;margin:12px 0 6px;color:#fff}#tbma-root p{margin:8px 0}#tbma-root a{color:#9bcdff}#tbma-root details{border-top:1px solid #40516a;padding:9px 0;margin-top:6px}#tbma-root summary{cursor:pointer;padding:7px 0;font-weight:600}#tbma-root table{width:100%;border-collapse:collapse;font-size:13px}#tbma-root td,#tbma-root th{text-align:left;border-bottom:1px solid #40516a;padding:8px;vertical-align:top;overflow-wrap:anywhere}#tbma-root .tbma-scroll{overflow-x:auto}#tbma-root .tbma-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}#tbma-root .tbma-field{display:flex;flex-direction:column;gap:4px;margin:7px 0}#tbma-root textarea{width:100%;background:#0f1722;color:#dce8f8;font:12px/1.4 monospace;padding:8px}#tbma-root .tbma-notice{border-left:3px solid #e9b85a;padding:8px;background:#283044}#tbma-root [data-tbma-health]{display:flex;flex-direction:column;font-size:12px;color:#b9c9de}#tbma-root #tbma-support{position:static!important;inset:auto!important;z-index:auto!important;max-width:360px;margin-top:16px}#tbma-root #tbma-support .tw-torn-tip{color:#112000!important}
+#tbma-root *{box-sizing:border-box}#tbma-root [hidden]{display:none!important}#tbma-root header{display:flex;align-items:center;gap:8px;flex-wrap:wrap}#tbma-root header strong{flex:1}#tbma-root button,#tbma-root select,#tbma-root input{font:inherit;border:1px solid #798ca4;border-radius:5px;min-height:38px;padding:6px 9px;background:#25364b;color:#fff;max-width:100%}#tbma-root button{cursor:pointer;margin:3px}#tbma-root button:disabled{opacity:.5;cursor:default}#tbma-root :focus-visible{outline:3px solid #7cbfff;outline-offset:2px}#tbma-root input[type=checkbox]{min-height:22px;width:22px}#tbma-root h3{font-size:16px;margin:12px 0 6px;color:#fff}#tbma-root p{margin:8px 0}#tbma-root a{color:#9bcdff}#tbma-root details{border-top:1px solid #40516a;padding:9px 0;margin-top:6px}#tbma-root summary{cursor:pointer;padding:7px 0;font-weight:600}#tbma-root table{width:100%;border-collapse:collapse;font-size:13px}#tbma-root td,#tbma-root th{color:#eaf0f8!important;background:#17202c!important;text-align:left;border-bottom:1px solid #40516a;padding:8px;vertical-align:top;overflow-wrap:anywhere}#tbma-root .tbma-scroll{overflow-x:auto}#tbma-root .tbma-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}#tbma-root .tbma-field{display:flex;flex-direction:column;gap:4px;margin:7px 0}#tbma-root textarea{width:100%;background:#0f1722;color:#dce8f8;font:12px/1.4 monospace;padding:8px}#tbma-root .tbma-notice{border-left:3px solid #e9b85a;padding:8px;background:#283044}#tbma-root [data-tbma-health]{display:flex;flex-direction:column;font-size:12px;color:#b9c9de}#tbma-root #tbma-support{position:static!important;inset:auto!important;z-index:auto!important;max-width:360px;margin-top:16px}#tbma-root #tbma-support .tw-torn-tip{color:#112000!important}
 @media(max-width:500px){#tbma-root{margin:6px;padding:9px}#tbma-root .tbma-grid{grid-template-columns:1fr}#tbma-root table{font-size:12px}}
 `;document.head.append(s);
 }
