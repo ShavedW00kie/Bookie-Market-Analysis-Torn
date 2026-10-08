@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.2.9
+// @version      0.2.10
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -2499,7 +2499,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.2.9';
+const VERSION = '0.2.10';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -3169,6 +3169,30 @@ function showReference(result) {
     sourceArea.focus({preventScroll:true});
     referencePanel.scrollIntoView({block:'nearest'});
 }
+function referenceDiagnostics(result) {
+    // Explicit allowlist: never serialize the transport, settings or entire result object.
+    const event=result.event||{};
+    const report={version:VERSION,capturedAt:new Date().toISOString(),provider:result.provider,
+        settlementStatus:'unverified — reference only',
+        event:{id:event.id,sportKey:event.sportKey,league:event.league,start:event.start,participants:event.participants},
+        identityNote:result.identityNote||null,
+        sources:(result.sources||[]).map(s=>({underlyingSource:s.underlyingSource,label:s.label,
+            outcomes:s.outcomes,decimalOdds:s.odds,normalizedProbabilities:s.probabilities,updatedAt:s.updatedAt,
+            settlementStatus:'unverified'})),
+        rejected:(result.rejected||[]).map(r=>({source:r.source,reason:r.reason}))};
+    return JSON.parse(Core.redact(JSON.stringify(report),[...sessionKeys.values()]));
+}
+function buildReferenceExport(parent,result) {
+    const box=detail(parent,'Export reference odds — bookmaker review');
+    box.append(el('p','Exports this loaded snapshot, including bookmaker names, odds, quote times and exclusions. No additional API request. Source settlement rules remain unverified.'));
+    const text=el('textarea');text.readOnly=true;text.rows=8;text.style.width='100%';text.hidden=true;text.setAttribute('aria-label','Reference odds diagnostics JSON');
+    const note=el('p');note.setAttribute('role','status');
+    const prepare=()=>{if(currentReference!==result)throw new Error('Reference changed. Export the current result.');text.value=JSON.stringify(referenceDiagnostics(result),null,2);text.hidden=false;};
+    box.append(button('Download reference odds diagnostics (no keys)',async()=>{
+        try{prepare();await download('TBMA_Reference_Odds.json',text.value);note.textContent='Download requested. If absent from Downloads, use Show / select reference JSON.';}
+        catch(e){note.textContent='Export failed. Use Show / select reference JSON if downloading is unavailable.';throw e;}
+    }),button('Show / select reference JSON',()=>{prepare();text.focus();text.select();note.textContent='Selected. Copy and save as TBMA_Reference_Odds.json, or paste into chat.';}),note,text);
+}
 function renderReference(result) {
     clearTimeout(freshnessTimer);
     currentReference=result;sourceArea.replaceChildren();
@@ -3193,6 +3217,7 @@ function renderReference(result) {
         sourceArea.append(el('p','Cumulative contract volume (provider units): '+String(result.volume??'Unavailable')+'. Volume is not the percentage of people backing an outcome.'));
         detail(sourceArea,'Resolution description').append(el('p',result.description));return;
     }
+    buildReferenceExport(sourceArea,result);
     const e=result.event;sourceArea.append(el('strong',e.participants.join(' vs ')+' · '+e.league));sourceArea.append(el('p','Start: '+e.start+' · External event ID: '+e.id));
     const outcomeSets=new Map();
     for(const s of result.sources){const key=[...s.outcomes].map(Core.name).sort().join('|');if(!outcomeSets.has(key))outcomeSets.set(key,[]);outcomeSets.get(key).push(s);}
@@ -3206,7 +3231,7 @@ function renderReference(result) {
             table(sourceArea,['Outcome','Reference probability','Source range width'],outcomes.map((o,i)=>[o,percent(c.probabilities[i]),(c.spread[i]*100).toFixed(1)+' percentage points']));
         }else sourceArea.append(el('p','No fresh estimate. Prices may be old, missing, or invalid.'));
         const breakdown=detail(sourceArea,'Source odds, freshness, and exclusions');
-        table(breakdown,['Source','Decimal odds','Last quote/change time'],group.map(s=>[s.label,s.outcomes.map((o,i)=>o+': '+s.odds[i]).join(' · '),s.updatedAt]));
+        table(breakdown,['Source','Decimal odds','Last quote/change time','Torn settlement compatibility'],group.map(s=>[s.label,s.outcomes.map((o,i)=>o+': '+s.odds[i]).join(' · '),s.updatedAt,'Unverified — reference only']));
         for(const r of c.rejected)breakdown.append(el('p',r.source+': '+r.reason));
     }
     const rejected=detail(sourceArea,'Rejected sources');for(const r of result.rejected)rejected.append(el('p',r.source+': '+r.reason));
