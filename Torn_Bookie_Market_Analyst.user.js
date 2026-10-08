@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.2.8
+// @version      0.2.9
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -152,6 +152,16 @@ const Core = (() => {
             renormalized:Math.abs(raw.reduce((a,b)=>a+b,0)-1)>1e-9,
             label:data.length===1?'Single-source estimate':'Median consensus'};
     };
+    const quoteQuality = (book, now, maxAgeMs) => {
+        const reasons=[];
+        const spread=book.ask-book.bid;
+        if(!Number.isFinite(spread)||spread<0)reasons.push('Invalid spread');
+        else if(spread>0.05+1e-12)reasons.push('Wide spread: exceeds 5 percentage points');
+        if(!Number.isFinite(book.bidSize)||!Number.isFinite(book.askSize)||Math.min(book.bidSize,book.askSize)<100)reasons.push('Thin best-price liquidity: fewer than 100 shares on a side');
+        const age=now-Date.parse(book.updatedAt);
+        if(!Number.isFinite(age)||age>maxAgeMs||age < -30000)reasons.push('Stale or invalid quote time');
+        return {ok:reasons.length===0,reasons,spread};
+    };
     const midpoint = (bid, ask, bidSize, askSize, maxSpread = 0.1) => {
         bid=probability(bid); ask=probability(ask);
         if (bid <= 0 || ask >= 1 || ask < bid) fail('Empty or crossed order book');
@@ -180,7 +190,7 @@ const Core = (() => {
         }
         return {profit,turnover,roi:turnover?profit/turnover:null,drawdown,brier:scored?brier/scored:null,scored,pending:rows.filter(r=>r.result==='pending').reduce((a,b)=>a+b.stake,0)};
     };
-    return {number, decimal, probability, normalize, devig, payouts, settledNet, name, timestamp, median, sourceId, compareEvents, chooseEvent, consensus, midpoint, redact, journalStats};
+    return {number, decimal, probability, normalize, devig, payouts, settledNet, name, timestamp, median, sourceId, compareEvents, chooseEvent, consensus, midpoint, quoteQuality, redact, journalStats};
 })();
 
 /**
@@ -2489,7 +2499,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.2.8';
+const VERSION = '0.2.9';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -3171,10 +3181,15 @@ function renderReference(result) {
     sourceArea.append(el('p',result.ruleStatus,'tbma-notice'));
     if(result.provider==='poly') {
         sourceArea.append(el('strong',result.title));
-        table(sourceArea,['Contract outcome','Reference midpoint','Bid / ask','Quote age','Depth (shares)'],result.outcomes.map((o,i)=>{
-            const b=result.books[i],age=Math.max(0,Math.round((Date.now()-Date.parse(b.updatedAt))/1000));
-            return [o,age>settings.maxAge?'STALE — no estimate':percent(result.probabilities[i]),`${b.bid} / ${b.ask}`,age+' seconds',`${b.bidSize} bid / ${b.askSize} ask`];
+        const quality=result.books.map(b=>Core.quoteQuality(b,Date.now(),settings.maxAge*1000));
+        const usable=quality.every(q=>q.ok);
+        sourceArea.append(el('p',usable?'Single-source reference estimate; screening passed, not proof of accuracy.':'⚠ Probability estimate withheld: one or more outcome books failed quality screening.','tbma-notice'));
+        table(sourceArea,['Contract outcome','Screened reference estimate','Bid / ask','Spread (percentage points)','Quote age','Best-price quantity (shares)','Quality'],result.outcomes.map((o,i)=>{
+            const b=result.books[i],q=quality[i],age=Math.max(0,Math.round((Date.now()-Date.parse(b.updatedAt))/1000));
+            return [o,usable?percent(result.probabilities[i]):'WITHHELD',`${b.bid} / ${b.ask}`,(q.spread*100).toFixed(2),age+' seconds',`${b.bidSize} bid / ${b.askSize} ask`,q.ok?'Pass':q.reasons.join('; ')];
         }));
+        sourceArea.append(el('p','Screening policy: maximum 5-percentage-point spread, minimum 100 shares at each best price, and the configured maximum quote age. These are conservative heuristics, not validated accuracy guarantees. Quantities are at the best bid/ask only, not total order-book depth.'));
+        if(usable)sourceArea.append(el('p','Reference rule: midpoint of best bid and ask for each outcome, then normalize the two midpoints to sum to 100%. Display rounding may differ. This is one exchange, not consensus.'));
         sourceArea.append(el('p','Cumulative contract volume (provider units): '+String(result.volume??'Unavailable')+'. Volume is not the percentage of people backing an outcome.'));
         detail(sourceArea,'Resolution description').append(el('p',result.description));return;
     }
