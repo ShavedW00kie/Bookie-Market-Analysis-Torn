@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Bookie Market Analyst
 // @namespace    https://github.com/ShavedW00kie/
-// @version      0.2.7
+// @version      0.2.8
 // @description  Verification release: read-only external odds, paper analysis, and sanitized DOM capture. Observed Torn rows with calculated returns; external matching remains unverified.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -2489,7 +2489,7 @@ function createSupportClass() {
 const SupportModule = createSupportClass();
 
 /* Runtime services. Fail closed on storage, quota, or transport uncertainty. */
-const VERSION = '0.2.7';
+const VERSION = '0.2.8';
 const APP = 'Torn Bookie Market Analyst';
 const GM_info = nativeInfo ||
     (typeof GM !== 'undefined' && GM.info ? GM.info : {script:{name:APP,version:VERSION}});
@@ -3197,6 +3197,35 @@ function renderReference(result) {
     const rejected=detail(sourceArea,'Rejected sources');for(const r of result.rejected)rejected.append(el('p',r.source+': '+r.reason));
     sourceArea.append(el('p','Estimates use proportional margin removal. Two-way estimates may be conditional on a decisive result when a tie refunds. Bookmaker settlement rules are not verified equivalent; no Torn edge, favorite, or value badge is generated.'));
 }
+function buildPublicExport(parent,payload,isCurrent) {
+    const note=el('p');note.setAttribute('role','status');note.setAttribute('aria-live','polite');
+    const fallback=detail(parent,'Public search JSON — manual copy fallback');
+    const text=el('textarea');text.readOnly=true;text.rows=10;text.style.width='100%';
+    text.setAttribute('aria-label','Public search diagnostics JSON');
+    fallback.append(el('p','If no file downloads, select this text, copy it, and save it as TBMA_Polymarket_Search.json in a text editor. This is the public search response summary, not an order-book result.'),text);
+    const prepare=()=>{if(!isCurrent())throw new Error('Search context changed. Search again.');text.value=JSON.stringify({version:VERSION,...payload},null,2);fallback.open=true;};
+    parent.append(button('Download public search diagnostics',async()=>{
+        try{prepare();note.textContent='Requesting download… JSON is also available in the copy box.';
+            await download('TBMA_Polymarket_Search.json',text.value);
+            note.textContent='Download requested. Check browser Downloads (Ctrl+J on Windows). Saving cannot be confirmed by the script. If absent, use the JSON copy box.';
+        }catch(e){note.textContent='Export failed: '+Core.redact(e?.message||'Unknown error',[...sessionKeys.values()]);throw e;}
+    }),button('Show / select public search JSON',()=>{prepare();text.focus();text.select();note.textContent='JSON selected. Press Ctrl+C, or use your device’s Copy action.';}),note);
+}
+function buildPolyReader(parent,market) {
+    const note=el('p','Read market displays reference results; it does not download JSON.');
+    note.setAttribute('role','status');note.setAttribute('aria-live','polite');
+    let sequence=0;
+    market.addEventListener('input',()=>{sequence++;note.textContent='Market changed. Click Read market to inspect it.';});
+    parent.append(button('Read market (≤3 public reads)',async()=>{
+        const g=routeGeneration,id=market.value.trim(),token=++sequence;
+        const current=()=>g===routeGeneration&&token===sequence&&id===market.value.trim();
+        note.textContent='Reading market '+id+' and checking both outcome books…';
+        try{const r=await Providers.polyMarket(id);
+            if(!current()){if(g===routeGeneration&&token===sequence)note.textContent='Selection changed; previous result discarded. Click Read market again.';return;}
+            showReference(r);note.textContent='Reference loaded in the open Reference results section. This is not a verified Torn match.';
+        }catch(e){if(current()){note.textContent='Market read failed: '+Core.redact(e?.message||'Unknown error',[...sessionKeys.values()]);showError(e);}}
+    }),note);
+}
 function buildPolyDiscovery(parent,marketInput) {
     const box=detail(parent,'Find Polymarket events — public search');
     box.append(el('p','Enable Polymarket in Settings; no key or wallet is needed. Search returns candidates, not verified Torn matches. Check race versus season, date and resolution conditions. No prices are inferred from search metadata.'));
@@ -3214,11 +3243,11 @@ function buildPolyDiscovery(parent,marketInput) {
             const eventBox=detail(resultArea,event.title);eventBox.append(el('p','Event ID: '+event.id+' · End: '+(event.endDate||'Unknown')+' · Active: '+event.active+' · Closed: '+event.closed));
             for(const m of event.markets){
                 const item=detail(eventBox,m.question);item.append(el('p',`Market ID: ${m.id} · End: ${m.endDate||'Unknown'} · Active: ${m.active} · Closed: ${m.closed}`),el('p',m.description||'Resolution description absent from search result.'));
-                const pick=button('Use this market ID for reference inspection',()=>{if(g!==routeGeneration||token!==sequence)throw new Error('Search context changed. Search again.');marketInput.value=m.id;statusLine.textContent='Market ID selected. Use Read market to inspect current books; Torn equivalence remains unverified.';});
+                const pick=button('Use this market ID for reference inspection',()=>{if(g!==routeGeneration||token!==sequence)throw new Error('Search context changed. Search again.');marketInput.value=m.id;pick.textContent='Selected market '+m.id+' — use Read market';statusLine.textContent='Market ID selected. Use Read market to inspect current books; Torn equivalence remains unverified.';});
                 pick.disabled=event.active!==true||event.closed!==false||m.active!==true||m.closed!==false||m.enableOrderBook!==true||!/^\d{1,30}$/.test(m.id);item.append(pick);
             }
         }
-        resultArea.append(button('Download public search diagnostics',()=>{if(g!==routeGeneration||token!==sequence)throw new Error('Search context changed. Search again.');return download('TBMA_Polymarket_Search.json',JSON.stringify({version:VERSION,...r},null,2));}));
+        buildPublicExport(resultArea,r,()=>g===routeGeneration&&token===sequence);
         next.disabled=r.hasMore!==true||r.page>=10;
         if(r.hasMore===null)resultArea.append(el('p','Pagination status unavailable; completeness unknown.'));
         if(r.hasMore&&r.page>=10)resultArea.append(el('p','Ten-page safety limit reached. Refine the search.'));
@@ -3246,7 +3275,7 @@ function buildProviderExplorer(parent) {
     const poly=detail(explorer,'Polymarket — binary market and two-sided books');
     const market=labelInput(poly,'Numeric market ID (not event ID or slug)');
     buildPolyDiscovery(poly,market);
-    poly.append(button('Read market (≤3 public reads)',async()=>{const g=routeGeneration,r=await Providers.polyMarket(market.value.trim());if(g===routeGeneration)showReference(r);}));
+    buildPolyReader(poly,market);
     safeLink(poly,'Public API documentation','https://docs.polymarket.com/api-reference/predictions/overview');
 
 }
